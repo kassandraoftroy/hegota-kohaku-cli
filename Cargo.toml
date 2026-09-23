@@ -1,0 +1,38 @@
+[package]
+name = "kohaku-hegota"
+version = "0.0.1"
+edition = "2024"
+
+[[bin]]
+name = "kohaku-hegota"
+path = "src/main.rs"
+
+[dependencies]
+alloy = { version = "=2.4.1", features = [
+    "signer-local",
+    "signer-mnemonic",
+    "providers",
+    "network",
+    "reqwest",
+    "rpc",
+    "sol-types",
+    "contract",
+    "signers",
+] }
+anyhow = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+coins-bip39 = { version = "0.12", default-features = false, features = ["english"] }
+dialoguer = "0.11"
+hex = "0.4"
+kohaku-frametx-kit = { path = "../kohaku-rs/crates/frametx-kit" }
+kohaku-kv-store = { path = "../kohaku-rs/crates/kv-store" }
+kohaku-minimal-shield = { path = "../kohaku-rs/crates/minimal-shield" }
+rand = "0.10"
+reqwest = { version = "0.13.4", default-features = false }
+ruint = { version = "1.20", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }
+toml = "0.8"

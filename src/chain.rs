@@ -1,0 +1,113 @@
+//! Network profile and RPC helpers. The only HTTP endpoint is the Ethereum RPC.
+
+use std::path::PathBuf;
+
+use alloy::{
+    primitives::Address,
+    providers::{Provider, ProviderBuilder},
+};
+use anyhow::{Context, Result, bail};
+use kohaku_frametx_kit::FrameTxClient;
+use kohaku_minimal_shield::Pool;
+use serde::Deserialize;
+
+#[derive(Debug, Clone)]
+pub struct Network {
+    pub name: String,
+    pub chain_id: u64,
+    pub pool: Address,
+    pub factory: Address,
+    pub multicall3: Address,
+    pub deployed_block: u64,
+}
+
+#[derive(Deserialize)]
+struct NetworkFile {
+    name: String,
+    chain_id: u64,
+    pool: String,
+    factory: String,
+    multicall3: String,
+    deployed_block: u64,
+}
+
+pub fn load_network(name: &str) -> Result<Network> {
+    let raw = match name {
+        "devnet" => include_str!("../networks/devnet.toml"),
+        "testnet" => include_str!("../networks/testnet.toml"),
+        "mainnet" => include_str!("../networks/mainnet.toml"),
+        other => bail!("unknown network {other} (devnet, testnet, or mainnet)"),
+    };
+    let file: NetworkFile = toml::from_str(raw)?;
+    let mut net = Network {
+        name: file.name,
+        chain_id: file.chain_id,
+        pool: parse_addr(&file.pool)?,
+        factory: parse_addr(&file.factory)?,
+        multicall3: parse_addr(&file.multicall3)?,
+        deployed_block: file.deployed_block,
+    };
+    if let Ok(v) = std::env::var("HEGOTA_POOL") {
+        net.pool = parse_addr(&v)?;
+    }
+    if let Ok(v) = std::env::var("HEGOTA_FACTORY") {
+        net.factory = parse_addr(&v)?;
+    }
+    if let Ok(v) = std::env::var("HEGOTA_MULTICALL3") {
+        net.multicall3 = parse_addr(&v)?;
+    }
+    if let Ok(v) = std::env::var("HEGOTA_DEPLOYED_BLOCK") {
+        net.deployed_block = v.parse().context("HEGOTA_DEPLOYED_BLOCK")?;
+    }
+    Ok(net)
+}
+
+pub fn require_factory(net: &Network) -> Result<Address> {
+    if net.factory.is_zero() {
+        bail!(
+            "FrameAccount factory is not set. Redeploy it with `just deploy-factory` and set \
+             `factory` in the network profile or HEGOTA_FACTORY. The previous factory's accounts \
+             cannot approve themselves."
+        );
+    }
+    Ok(net.factory)
+}
+
+pub fn pool_of(net: &Network) -> Pool {
+    Pool {
+        chain_id: net.chain_id,
+        address: net.pool,
+        factory: net.factory,
+        deployed_block: net.deployed_block,
+    }
+}
+
+pub fn rpc_url(flag: Option<String>) -> Result<reqwest::Url> {
+    let raw = flag
+        .or_else(|| std::env::var("RPC_URL").ok())
+        .or_else(|| std::env::var("HEGOTA_RPC_URL").ok())
+        .context("pass --rpc-url or set RPC_URL")?;
+    raw.parse().context("rpc url")
+}
+
+pub fn frame_client(url: &reqwest::Url) -> FrameTxClient {
+    FrameTxClient::new(url.clone())
+}
+
+pub fn http_provider(url: reqwest::Url) -> impl Provider + Clone {
+    ProviderBuilder::new().connect_http(url)
+}
+
+pub fn indexer_path(data_dir: &std::path::Path, wallet: &str, network: &str) -> PathBuf {
+    data_dir
+        .join(wallet)
+        .join(format!("indexer-{network}.redb"))
+}
+
+fn parse_addr(s: &str) -> Result<Address> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(Address::ZERO);
+    }
+    s.parse().with_context(|| format!("address {s}"))
+}
