@@ -1,8 +1,8 @@
 # hegota-kohaku-cli
 
-a cli that mirors the functionality of kohaku-cli but works with hegota EIPs and a new ETH mixer that integrates the hegota privacy EIPs and frame txs for private txs with no brpadacster/relayer
+a cli that mirors the functionality of kohaku-cli but works with hegota EIPs and a new ETH mixer that integrates the hegota EIPs
 
-# run
+## demo
 
 you need the kohaku-rs repo at this branch https://github.com/ethereum/kohaku-rs/tree/experiments/minimal-shield-frames
 
@@ -51,7 +51,7 @@ kohaku-hegota create-wallet dev
 
 kohaku-hegota balances --verbose
 
-{fund EOA 0}
+{fund EOA 0 with some devnet ETH}
 
 kohaku-hegota shield
 
