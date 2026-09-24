@@ -17,7 +17,7 @@ use kohaku_kv_store::{Store, file::FileStore};
 use kohaku_minimal_shield::{
     Call, Note, PoolProvider, SelectError,
     abis::ShieldedPool,
-    indexer::{Indexer, rpc::RpcSyncer, syncer::Syncer, verifier::Verifier},
+    indexer::{Indexer, rpc::RpcSyncer, syncer::SyncerBackend, verifier::Verifier},
     plan_unshield,
 };
 use ruint::aliases::U256 as Ruint;
@@ -27,6 +27,7 @@ use crate::{
     accounts::{self, Eoa, Smart},
     chain::{self, Network, Token},
     txbuild::{self, APPROVE_EXEC, APPROVE_STATE, OutCall},
+    sync_cache::{self, Extend, SyncCache},
     wallet::{self, SavedNote, Secrets},
 };
 
@@ -829,17 +830,22 @@ async fn provider_for(app: &App) -> Result<PoolProvider> {
         std::fs::create_dir_all(parent)?;
     }
     let store = Store::new(FileStore::open(path)?);
-    let rpc = RpcSyncer::new(url_provider).with_progress(block_sync_progress());
+    let pool = chain::pool_of(&app.net);
+    let rpc = RpcSyncer::new(url_provider).with_progress(block_sync_progress("syncing wallet"));
     let indexer = Indexer::new(
-        chain::pool_of(&app.net),
+        pool,
         store,
-        Syncer::new(rpc.clone()),
+        sync_cache::syncer_for(
+            rpc.clone(),
+            sync_cache::cache_path(&app.root, &app.net.name),
+            &pool,
+        ),
         Verifier::new(rpc),
     );
     Ok(PoolProvider::new(indexer))
 }
 
-fn block_sync_progress() -> impl Fn(u64, u64) + Send + Sync {
+fn block_sync_progress(label: &'static str) -> impl Fn(u64, u64) + Send + Sync {
     use std::io::{IsTerminal, Write};
     use std::sync::atomic::{AtomicU8, Ordering};
     let last_pct = AtomicU8::new(255);
@@ -854,13 +860,13 @@ fn block_sync_progress() -> impl Fn(u64, u64) + Send + Sync {
             let width = 28usize;
             let filled = usize::from(pct) * width / 100;
             let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
-            eprint!("\rsyncing wallet [{bar}] {pct:>3}%");
+            eprint!("\r{label} [{bar}] {pct:>3}%");
             let _ = stderr.lock().flush();
             if pct == 100 {
                 eprintln!();
             }
         } else if pct == 100 || prev == 255 || pct / 10 != prev / 10 {
-            eprintln!("syncing wallet {pct}%");
+            eprintln!("{label} {pct}%");
         }
     }
 }
@@ -873,7 +879,7 @@ async fn sync_notes(app: &mut App, provider: &impl Provider) -> Result<()> {
         .call()
         .await
         .unwrap_or(0);
-    let spent = spent_nullifiers(provider, app.net.pool, app.net.deployed_block).await?;
+    let spent = spent_nullifiers(app, provider).await?;
     if spent.is_empty() {
         return Ok(());
     }
@@ -906,19 +912,81 @@ async fn sync_notes(app: &mut App, provider: &impl Provider) -> Result<()> {
     Ok(())
 }
 
+pub async fn hydrate_local_cache(
+    root: &std::path::Path,
+    net: &Network,
+    rpc: reqwest::Url,
+    non_interactive: bool,
+) -> Result<()> {
+    if net.pool.is_zero() {
+        bail!("this network has no pool");
+    }
+    let pool = chain::pool_of(net);
+    let path = sync_cache::cache_path(root, &net.name);
+    let provider = chain::http_provider(rpc);
+    let syncer = RpcSyncer::new(provider).with_progress(block_sync_progress("hydrating cache"));
+    let head = syncer.latest_block(&pool).await?;
+    let mut cache = SyncCache::open(&path, pool.chain_id, pool.address, pool.deployed_block)?;
+    let from = cache.through().saturating_add(1).max(pool.deployed_block);
+    let extended = if from > head {
+        Extend::Stored {
+            through: cache.through(),
+        }
+    } else {
+        let fetched = syncer.fetch(&pool, from, head).await?;
+        cache.extend(from, head, &fetched)?
+    };
+    let through = match extended {
+        Extend::Stored { through } | Extend::Full { through } => through,
+    };
+    let full = matches!(extended, Extend::Full { .. });
+    if non_interactive {
+        println!(
+            "{}",
+            json!({
+                "path": path.display().to_string(),
+                "throughBlock": through,
+                "bytes": cache.len_bytes(),
+                "full": full,
+            })
+        );
+    } else {
+        println!("cache {}", path.display());
+        println!("through block {through}");
+        println!("size {} bytes", cache.len_bytes());
+        if full {
+            println!("cache is 1GB; not storing events past block {through}");
+        }
+    }
+    Ok(())
+}
+
 async fn spent_nullifiers(
+    app: &App,
     provider: &impl Provider,
-    pool: Address,
-    from_block: u64,
 ) -> Result<std::collections::HashSet<Ruint>> {
     use alloy::rpc::types::Filter;
     use kohaku_minimal_shield::abis::ShieldedPool::NoteSpent;
-    let filter = Filter::new()
-        .address(pool)
-        .event_signature(NoteSpent::SIGNATURE_HASH)
-        .from_block(from_block);
-    let logs = provider.get_logs(&filter).await?;
+    let path = sync_cache::cache_path(&app.root, &app.net.name);
+    let mut from = app.net.deployed_block;
     let mut out = std::collections::HashSet::new();
+    if path.exists() {
+        let mut cache = SyncCache::open(&path, app.net.chain_id, app.net.pool, app.net.deployed_block)?;
+        let through = cache.through();
+        for nf in cache.spent_through(through)? {
+            out.insert(nf);
+        }
+        from = through.saturating_add(1).max(from);
+    }
+    let head = provider.get_block_number().await?;
+    if from > head {
+        return Ok(out);
+    }
+    let filter = Filter::new()
+        .address(app.net.pool)
+        .event_signature(NoteSpent::SIGNATURE_HASH)
+        .from_block(from);
+    let logs = provider.get_logs(&filter).await?;
     for log in logs {
         if let Some(topic) = log.topics().get(1) {
             out.insert(Ruint::from_be_bytes(topic.0));

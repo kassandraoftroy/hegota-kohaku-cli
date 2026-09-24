@@ -3,6 +3,7 @@
 mod accounts;
 mod chain;
 mod flow;
+mod sync_cache;
 mod txbuild;
 mod wallet;
 
@@ -56,6 +57,8 @@ enum Command {
     ListWallets,
     /// Print the CLI version.
     Version,
+    /// Download pool events into an unencrypted cache shared by every wallet.
+    HydrateLocalCache,
     /// Print the seed phrase.
     RevealSeedPhrase,
     /// Print an EOA key or a smart-account owner key (`a0`).
@@ -143,6 +146,12 @@ async fn main() -> Result<()> {
     if matches!(cli.cmd, Command::Version) {
         println!("kohaku-hegota {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if matches!(cli.cmd, Command::HydrateLocalCache) {
+        let root = wallet::data_root(cli.data_dir.clone());
+        let rpc = chain::rpc_url(cli.rpc_url.clone())?;
+        let net = load_network(&cli.network)?;
+        return flow::hydrate_local_cache(&root, &net, rpc, cli.non_interactive).await;
     }
     if matches!(cli.cmd, Command::ListWallets) {
         let root = wallet::data_root(cli.data_dir);
@@ -235,7 +244,9 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::CreateWallet { .. } | Command::ListWallets => unreachable!(),
+        Command::CreateWallet { .. } | Command::ListWallets | Command::HydrateLocalCache => {
+            unreachable!()
+        }
     }
 }
 

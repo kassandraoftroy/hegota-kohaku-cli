@@ -3742,6 +3742,7 @@ dependencies = [
  "alloy",
  "anyhow",
  "argon2",
+ "async-trait",
  "chacha20poly1305",
  "clap",
  "coins-bip39",
