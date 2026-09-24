@@ -24,12 +24,17 @@ cargo build --release
 set env vars:
 
 ```
-export EVENT_CACHE_ENDPOINT=https://artifacts.0000000000.org/hegota-devnet/pool-sync-devnet.bin
 export PATH="$PWD/target/release:$PATH"
 export HEGOTA_RPC_URL="<hegota devnet rpc>"
 ```
 
 you need a devnet RPC url.
+
+optional env var (makes first sync faster)
+
+```
+export EVENT_CACHE_ENDPOINT=https://artifacts.0000000000.org/hegota-devnet/pool-sync-devnet.bin
+```
 
 now you can run all the `kohaku-hegota` commands and demo the wallet.
 
