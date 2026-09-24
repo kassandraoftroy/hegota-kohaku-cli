@@ -24,6 +24,7 @@ cargo build --release
 set env vars:
 
 ```
+export EVENT_CACHE_ENDPOINT=https://artifacts.0000000000.org/hegota-devnet/pool-sync-devnet.bin
 export PATH="$PWD/target/release:$PATH"
 export HEGOTA_RPC_URL="<hegota devnet rpc>"
 ```
