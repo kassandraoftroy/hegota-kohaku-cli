@@ -5,6 +5,7 @@ mod chain;
 mod flow;
 mod sync_cache;
 mod txbuild;
+mod ui;
 mod wallet;
 
 use std::path::PathBuf;
@@ -314,7 +315,7 @@ async fn create(
         println!("{body}");
     } else {
         println!("wallet {name} created. Write this phrase down; it is not shown again.");
-        println!("{phrase}");
+        crate::ui::print_box(&phrase);
         if let Some((accounts, smart_scanned)) = &found {
             println!(
                 "stored public indexes {}",

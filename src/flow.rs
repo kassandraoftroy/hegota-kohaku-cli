@@ -108,9 +108,8 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
     for s in &smart {
         smart_tokens.push(token_holdings(&provider, &app.net.tokens, s.account, &mut tick).await?);
     }
-    if done < total {
-        report(total, total.max(1));
-    }
+    // Close on real work (no fake snap to an overestimate).
+    report(done.max(1), done.max(1));
     if app.non_interactive {
         println!(
             "{}",
@@ -141,56 +140,92 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
         );
         return Ok(());
     }
-    println!("Public ETH: {}", fmt(public));
-    println!("Private ETH: {}", fmt_r(private));
-    if !verbose {
+
+    // 1. Aggregated public holdings (ETH + ERC-20s across EOAs / smart accounts).
+    crate::ui::print_section("Public holdings");
+    let mut public_rows = vec![vec!["ETH".into(), fmt(public)]];
+    for token in &app.net.tokens {
+        let mut sum = U256::ZERO;
+        for held in eoa_tokens.iter().chain(smart_tokens.iter()) {
+            for h in held.iter().filter(|h| h.symbol == token.symbol) {
+                sum += h.amount;
+            }
+        }
+        if !sum.is_zero() {
+            public_rows.push(vec![
+                token.symbol.clone(),
+                fmt_units(sum, token.decimals),
+            ]);
+        }
+    }
+    crate::ui::print_table(&["Asset", "Amount"], &public_rows);
+
+    // 2. Private ETH aggregate.
+    crate::ui::print_section("Private holdings");
+    crate::ui::print_table(
+        &["Asset", "Amount"],
+        &[vec!["ETH".into(), fmt_r(private)]],
+    );
+
+    if verbose {
+        // 3. Address-by-address (ETH labeled).
         for (e, tokens) in eoas.iter().zip(&eoa_tokens) {
-            print_token_lines(
-                &format!("EOA {}  {:#x}", e.index, e.signer.address()),
-                tokens,
-            );
+            crate::ui::print_section(&format!("EOA {}  {:#x}", e.index, e.signer.address()));
+            let mut rows = vec![vec!["ETH".into(), fmt(e.balance)]];
+            for h in tokens {
+                rows.push(vec![h.symbol.clone(), fmt_units(h.amount, h.decimals)]);
+            }
+            crate::ui::print_table(&["Asset", "Amount"], &rows);
         }
         for (s, tokens) in smart.iter().zip(&smart_tokens) {
-            print_token_lines(&format!("a{}  {:#x}", s.index, s.account), tokens);
+            let title = format!(
+                "a{}  {:#x}  (owner {:#x}){}",
+                s.index,
+                s.account,
+                s.owner.address(),
+                if s.deployed { "" } else { "  (not deployed)" }
+            );
+            crate::ui::print_section(&title);
+            let mut rows = vec![vec!["ETH".into(), fmt(s.balance)]];
+            for h in tokens {
+                rows.push(vec![h.symbol.clone(), fmt_units(h.amount, h.decimals)]);
+            }
+            crate::ui::print_table(&["Asset", "Amount"], &rows);
         }
-        return Ok(());
-    }
-    println!();
-    for (e, tokens) in eoas.iter().zip(&eoa_tokens) {
-        println!(
-            "EOA {}  {:#x}  {}",
-            e.index,
-            e.signer.address(),
-            fmt(e.balance)
+
+        // 4. Notes.
+        crate::ui::print_section("Notes");
+        let note_rows: Vec<Vec<String>> = app
+            .secrets
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                vec![
+                    i.to_string(),
+                    fmt_r(n.note.value),
+                    format!("{:#x}", b256(n.note.commitment())),
+                    n.index
+                        .map(|j| format!("m/8141'/1'/{j}'"))
+                        .unwrap_or_else(|| "—".into()),
+                    if n.pending {
+                        "pending".into()
+                    } else {
+                        String::new()
+                    },
+                ]
+            })
+            .collect();
+        crate::ui::print_table(
+            &["#", "Amount", "Commitment", "Path", "Status"],
+            &note_rows,
         );
-        print_token_lines("", tokens);
-    }
-    for (s, tokens) in smart.iter().zip(&smart_tokens) {
-        println!(
-            "a{}  account {:#x}  owner {:#x}  {}{}",
-            s.index,
-            s.account,
-            s.owner.address(),
-            fmt(s.balance),
-            if s.deployed { "" } else { "  (not deployed)" }
-        );
-        print_token_lines("", tokens);
-    }
-    for (i, n) in app.secrets.notes.iter().enumerate() {
-        println!(
-            "note {i}  {}  {:#x}{}{}",
-            fmt_r(n.note.value),
-            b256(n.note.commitment()),
-            n.index
-                .map(|j| format!("  m/8141'/1'/{j}'"))
-                .unwrap_or_default(),
-            if n.pending { "  (pending)" } else { "" }
-        );
-    }
-    if app.net.acct_factory.is_zero() {
-        println!(
-            "\nSmart accounts are hidden until FrameAccountFactory is redeployed (`just deploy-factory`)."
-        );
+
+        if app.net.acct_factory.is_zero() {
+            println!(
+                "\nSmart accounts are hidden until FrameAccountFactory is redeployed (`just deploy-factory`)."
+            );
+        }
     }
     Ok(())
 }
@@ -241,7 +276,7 @@ pub fn reveal_seed(app: &App) -> Result<()> {
     if app.non_interactive {
         println!("{}", json!({ "mnemonic": app.secrets.mnemonic }));
     } else {
-        println!("{}", app.secrets.mnemonic);
+        crate::ui::print_box(&app.secrets.mnemonic);
     }
     Ok(())
 }
@@ -875,14 +910,33 @@ async fn provider_for(app: &App) -> Result<PoolProvider> {
 }
 
 fn estimate_public_rpc_steps(app: &App) -> u64 {
-    let tokens = app.net.tokens.len() as u64;
-    let eoas = app.secrets.public_indexes.len() as u64;
-    let smart_hi = app.secrets.smart_indexes.iter().copied().max().unwrap_or(0);
-    let smart_checks = u64::from(smart_hi.saturating_add(8)) + 1;
-    let kept = app.secrets.smart_indexes.len() as u64;
-    // EOA: balance. Smart scan: predict + code per slot; kept slots also balance.
-    // Then balanceOf for each token on each EOA and kept smart account.
-    eoas * (1 + tokens) + smart_checks * 2 + kept * (1 + tokens)
+    estimate_public_rpc_steps_for(
+        app.net.tokens.len() as u64,
+        app.secrets.public_indexes.len() as u64,
+        &app.secrets.smart_indexes,
+        app.net.acct_factory.is_zero(),
+    )
+}
+
+/// RPC ticks for public-address sync, aligned with [`accounts::load_smart`].
+///
+/// Smart scan probes `0..=max(seen)` then one empty lookahead (`max+1`), not the
+/// `+8` safety cap. Zero factory means no smart RPCs.
+fn estimate_public_rpc_steps_for(
+    tokens: u64,
+    eoas: u64,
+    smart_indexes: &[u32],
+    factory_zero: bool,
+) -> u64 {
+    let eoa_steps = eoas * (1 + tokens);
+    if factory_zero {
+        return eoa_steps;
+    }
+    let smart_hi = smart_indexes.iter().copied().max().unwrap_or(0);
+    // Slots 0..=hi plus one empty lookahead (matches load_smart early break).
+    let smart_slots = u64::from(smart_hi) + 2;
+    let kept = smart_indexes.len() as u64;
+    eoa_steps + smart_slots * 2 + kept * (1 + tokens)
 }
 
 fn block_sync_progress(
@@ -894,7 +948,7 @@ fn block_sync_progress(
     let last_pct = AtomicU8::new(255);
     let tick = std::sync::Mutex::new(std::time::Instant::now());
     move |done, total| {
-        let batch = tick
+        let last = tick
             .lock()
             .map(|mut tick| {
                 let took = tick.elapsed();
@@ -902,9 +956,10 @@ fn block_sync_progress(
                 took
             })
             .unwrap_or_default();
-        let pct = u8::try_from((done.saturating_mul(100) / total.max(1)).min(100)).unwrap_or(100);
+        let total = total.max(1);
+        let pct = u8::try_from((done.saturating_mul(100) / total).min(100)).unwrap_or(100);
         let prev = last_pct.swap(pct, Ordering::Relaxed);
-        if prev == pct && batch.as_millis() < 50 {
+        if prev == pct && last.as_millis() < 50 {
             return;
         }
         let stderr = std::io::stderr();
@@ -914,16 +969,19 @@ fn block_sync_progress(
             let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
             let at = start_block.map(|start| format!("  block {}", start.saturating_add(done)));
             eprint!(
-                "\r{label} [{bar}] {pct:>3}%{}  batch {:.1}s",
+                "\r{label} [{bar}] {pct:>3}%  {done}/{total}{}  last {:.1}s",
                 at.unwrap_or_default(),
-                batch.as_secs_f64()
+                last.as_secs_f64()
             );
             let _ = stderr.lock().flush();
             if pct == 100 {
                 eprintln!();
             }
         } else {
-            eprintln!("{label} {pct}% batch {:.1}s", batch.as_secs_f64());
+            eprintln!(
+                "{label} {pct}%  {done}/{total}  last {:.1}s",
+                last.as_secs_f64()
+            );
         }
     }
 }
@@ -1813,27 +1871,15 @@ fn token_json(held: &[Held]) -> Vec<Value> {
         .collect()
 }
 
-fn print_token_lines(prefix: &str, held: &[Held]) {
-    for h in held {
-        if prefix.is_empty() {
-            println!("  {}  {}", h.symbol, fmt_units(h.amount, h.decimals));
-        } else {
-            println!(
-                "{prefix}  {}  {}",
-                h.symbol,
-                fmt_units(h.amount, h.decimals)
-            );
-        }
-    }
-}
-
 fn fmt_r(v: Ruint) -> String {
     fmt(from_r(v))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{atomic_rejected, max_withdrawable, rejects_atomic_flag, ru64};
+    use super::{
+        atomic_rejected, estimate_public_rpc_steps_for, max_withdrawable, rejects_atomic_flag, ru64,
+    };
     use alloy::primitives::Address;
     use kohaku_frametx_kit::SimulateResult;
     use kohaku_minimal_shield::{Note, plan_unshield};
@@ -1880,5 +1926,28 @@ mod tests {
         let plan = plan_unshield(&notes, amount, fee, &mut rng).unwrap();
         assert_eq!(plan.merges.len(), 1);
         assert_eq!(amount, ru64(28));
+    }
+
+    #[test]
+    fn public_rpc_estimate_skips_smart_when_factory_zero() {
+        // 2 EOAs × (1 balance + 3 tokens) = 8; smart ignored.
+        assert_eq!(
+            estimate_public_rpc_steps_for(3, 2, &[0, 5], true),
+            8
+        );
+    }
+
+    #[test]
+    fn public_rpc_estimate_empty_smart_probes_two_slots() {
+        // hi=0 empty → 2 slots × 2 (predict+code); no kept balances/tokens.
+        // 1 EOA × (1 + 0 tokens) + 4 = 5.
+        assert_eq!(estimate_public_rpc_steps_for(0, 1, &[], false), 5);
+    }
+
+    #[test]
+    fn public_rpc_estimate_hi_five_uses_lookahead_not_plus_eight() {
+        // hi=5 → 7 slots × 2 = 14; kept=1 → balance + 2 tokens = 3.
+        // eoas=0 → 14 + 3 = 17.
+        assert_eq!(estimate_public_rpc_steps_for(2, 0, &[5], false), 17);
     }
 }

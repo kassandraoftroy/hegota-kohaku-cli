@@ -15,7 +15,7 @@ use crate::{
     wallet::{Secrets, SeedAccounts, eoa_path, signer_at, smart_owner_path},
 };
 
-const SCAN_BATCH: u32 = 10;
+const SCAN_BATCH: u32 = 5;
 const SCAN_LIMIT: u32 = 1000;
 
 /// Indexes kept after a gap scan: `0..=last_used`, or nothing when the first batch is unused.
@@ -163,7 +163,7 @@ pub async fn address_was_used(provider: &impl Provider, address: Address) -> Res
     Ok(!provider.get_balance(address).await?.is_zero())
 }
 
-/// Scan the first 10 indexes, then the next 10, until a batch is entirely unused.
+/// Scan the first 5 indexes, then the next 5, until a batch is entirely unused.
 pub async fn scan_index_batches<F, Fut>(mut used: F) -> Result<IndexScan>
 where
     F: FnMut(u32) -> Fut,
@@ -245,36 +245,38 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(calls, 10);
+        assert_eq!(calls, 5);
         assert!(scan.indexes.is_empty());
         assert_eq!(scan.next, 0);
     }
 
     #[tokio::test]
-    async fn used_at_five_stores_through_that_index() {
+    async fn used_at_two_stores_through_that_index() {
         let mut calls = 0u32;
         let scan = scan_index_batches(|index| {
             calls += 1;
-            async move { Ok(index == 5) }
+            async move { Ok(index == 2) }
         })
         .await
         .unwrap();
-        assert_eq!(calls, 20);
-        assert_eq!(scan.indexes, (0..=5).collect::<Vec<_>>());
-        assert_eq!(scan.next, 6);
+        // First batch 0..5 used; second batch 5..10 empty → stop.
+        assert_eq!(calls, 10);
+        assert_eq!(scan.indexes, (0..=2).collect::<Vec<_>>());
+        assert_eq!(scan.next, 3);
     }
 
     #[tokio::test]
-    async fn used_at_zero_and_fifteen_scans_three_batches() {
+    async fn used_at_zero_and_seven_scans_three_batches() {
         let mut calls = 0u32;
         let scan = scan_index_batches(|index| {
             calls += 1;
-            async move { Ok(index == 0 || index == 15) }
+            async move { Ok(index == 0 || index == 7) }
         })
         .await
         .unwrap();
-        assert_eq!(calls, 30);
-        assert_eq!(scan.indexes, (0..=15).collect::<Vec<_>>());
-        assert_eq!(scan.next, 16);
+        // Batches 0..5 and 5..10 used; 10..15 empty → stop.
+        assert_eq!(calls, 15);
+        assert_eq!(scan.indexes, (0..=7).collect::<Vec<_>>());
+        assert_eq!(scan.next, 8);
     }
 }
