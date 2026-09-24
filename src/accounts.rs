@@ -81,7 +81,7 @@ pub async fn load_smart(
     net: &Network,
     secrets: &Secrets,
 ) -> Result<Vec<Smart>> {
-    if net.factory.is_zero() {
+    if net.acct_factory.is_zero() {
         return Ok(Vec::new());
     }
     let mut seen = secrets.smart_indexes.clone();
@@ -95,7 +95,7 @@ pub async fn load_smart(
             break;
         }
         let owner = smart_owner(secrets, j)?;
-        let account = predict_account(provider, net.factory, owner.address()).await?;
+        let account = predict_account(provider, net.acct_factory, owner.address()).await?;
         let code = provider.get_code_at(account).await?;
         let deployed = !code.is_empty();
         if deployed || seen.contains(&j) {
@@ -199,11 +199,11 @@ pub async fn scan_imported(
         address_was_used(provider, signer.address()).await
     })
     .await?;
-    let smart_scanned = !net.factory.is_zero();
+    let smart_scanned = !net.acct_factory.is_zero();
     let smart = if smart_scanned {
         scan_index_batches(|index| async move {
             let owner = signer_at(mnemonic, &smart_owner_path(index))?;
-            let account = predict_account(provider, net.factory, owner.address()).await?;
+            let account = predict_account(provider, net.acct_factory, owner.address()).await?;
             address_was_used(provider, account).await
         })
         .await?

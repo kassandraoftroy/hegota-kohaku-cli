@@ -1,6 +1,6 @@
 name = "testnet"
 chain_id = 0
 pool = ""
-factory = ""
+acct_factory = ""
 multicall3 = ""
 deployed_block = 0

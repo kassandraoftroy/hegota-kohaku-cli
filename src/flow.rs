@@ -161,7 +161,7 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
             if n.pending { "  (pending)" } else { "" }
         );
     }
-    if app.net.factory.is_zero() {
+    if app.net.acct_factory.is_zero() {
         println!(
             "\nSmart accounts are hidden until FrameAccountFactory is redeployed (`just deploy-factory`)."
         );
@@ -634,7 +634,7 @@ pub async fn unshield(
 async fn load_one_smart(app: &App, provider: &impl Provider, j: u32) -> Result<Smart> {
     chain::require_factory(&app.net)?;
     let owner = accounts::smart_owner(&app.secrets, j)?;
-    let account = accounts::predict_account(provider, app.net.factory, owner.address()).await?;
+    let account = accounts::predict_account(provider, app.net.acct_factory, owner.address()).await?;
     let code = provider.get_code_at(account).await?;
     let balance = provider.get_balance(account).await?;
     Ok(Smart {
