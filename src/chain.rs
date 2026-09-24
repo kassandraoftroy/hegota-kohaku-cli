@@ -19,6 +19,14 @@ pub struct Network {
     pub factory: Address,
     pub multicall3: Address,
     pub deployed_block: u64,
+    pub tokens: Vec<Token>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub symbol: String,
+    pub address: Address,
+    pub decimals: u8,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +37,15 @@ struct NetworkFile {
     factory: String,
     multicall3: String,
     deployed_block: u64,
+    #[serde(default)]
+    tokens: Vec<TokenFile>,
+}
+
+#[derive(Deserialize)]
+struct TokenFile {
+    symbol: String,
+    address: String,
+    decimals: u8,
 }
 
 pub fn load_network(name: &str) -> Result<Network> {
@@ -46,6 +63,17 @@ pub fn load_network(name: &str) -> Result<Network> {
         factory: parse_addr(&file.factory)?,
         multicall3: parse_addr(&file.multicall3)?,
         deployed_block: file.deployed_block,
+        tokens: file
+            .tokens
+            .iter()
+            .map(|t| {
+                Ok(Token {
+                    symbol: t.symbol.clone(),
+                    address: parse_addr(&t.address)?,
+                    decimals: t.decimals,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
     };
     if let Ok(v) = std::env::var("HEGOTA_POOL") {
         net.pool = parse_addr(&v)?;

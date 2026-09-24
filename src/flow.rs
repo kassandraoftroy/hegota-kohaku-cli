@@ -4,6 +4,7 @@ use alloy::{
     primitives::{Address, B256, Bytes, U256, utils::parse_units},
     providers::Provider,
     signers::local::PrivateKeySigner,
+    sol,
     sol_types::SolEvent,
 };
 use anyhow::{Context, Result, bail};
@@ -24,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::{
     accounts::{self, Eoa, Smart},
-    chain::{self, Network},
+    chain::{self, Network, Token},
     txbuild::{self, APPROVE_EXEC, APPROVE_STATE, OutCall},
     wallet::{self, SavedNote, Secrets},
 };
@@ -49,6 +50,19 @@ struct Picked {
     smart: Option<Smart>,
 }
 
+sol! {
+    #[sol(rpc)]
+    interface Erc20Balance {
+        function balanceOf(address account) external view returns (uint256);
+    }
+}
+
+struct Held {
+    symbol: String,
+    amount: U256,
+    decimals: u8,
+}
+
 pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
     let provider = chain::http_provider(app.rpc.clone());
     sync_notes(app, &provider).await?;
@@ -65,23 +79,33 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
         .iter()
         .filter(|n| !n.pending)
         .fold(Ruint::ZERO, |a, n| a + n.note.value);
+    let mut eoa_tokens = Vec::with_capacity(eoas.len());
+    for e in &eoas {
+        eoa_tokens.push(token_holdings(&provider, &app.net.tokens, e.signer.address()).await?);
+    }
+    let mut smart_tokens = Vec::with_capacity(smart.len());
+    for s in &smart {
+        smart_tokens.push(token_holdings(&provider, &app.net.tokens, s.account).await?);
+    }
     if app.non_interactive {
         println!(
             "{}",
             json!({
                 "publicWei": public.to_string(),
                 "privateWei": private.to_string(),
-                "eoas": eoas.iter().map(|e| json!({
+                "eoas": eoas.iter().zip(&eoa_tokens).map(|(e, tokens)| json!({
                     "index": e.index,
                     "address": format!("{:#x}", e.signer.address()),
                     "wei": e.balance.to_string(),
+                    "tokens": token_json(tokens),
                 })).collect::<Vec<_>>(),
-                "smart": smart.iter().map(|s| json!({
+                "smart": smart.iter().zip(&smart_tokens).map(|(s, tokens)| json!({
                     "index": s.index,
                     "account": format!("{:#x}", s.account),
                     "owner": format!("{:#x}", s.owner.address()),
                     "deployed": s.deployed,
                     "wei": s.balance.to_string(),
+                    "tokens": token_json(tokens),
                 })).collect::<Vec<_>>(),
                 "notes": app.secrets.notes.iter().map(|n| json!({
                     "wei": n.note.value.to_string(),
@@ -96,18 +120,25 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
     println!("Public ETH: {}", fmt(public));
     println!("Private ETH: {}", fmt_r(private));
     if !verbose {
+        for (e, tokens) in eoas.iter().zip(&eoa_tokens) {
+            print_token_lines(&format!("EOA {}  {:#x}", e.index, e.signer.address()), tokens);
+        }
+        for (s, tokens) in smart.iter().zip(&smart_tokens) {
+            print_token_lines(&format!("a{}  {:#x}", s.index, s.account), tokens);
+        }
         return Ok(());
     }
     println!();
-    for e in &eoas {
+    for (e, tokens) in eoas.iter().zip(&eoa_tokens) {
         println!(
             "EOA {}  {:#x}  {}",
             e.index,
             e.signer.address(),
             fmt(e.balance)
         );
+        print_token_lines("", tokens);
     }
-    for s in &smart {
+    for (s, tokens) in smart.iter().zip(&smart_tokens) {
         println!(
             "a{}  account {:#x}  owner {:#x}  {}{}",
             s.index,
@@ -116,6 +147,7 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
             fmt(s.balance),
             if s.deployed { "" } else { "  (not deployed)" }
         );
+        print_token_lines("", tokens);
     }
     for (i, n) in app.secrets.notes.iter().enumerate() {
         println!(
@@ -463,6 +495,7 @@ pub async fn unshield(
                     &merge.inputs,
                     Some(&output),
                     Ruint::ZERO,
+                    false,
                     Address::ZERO,
                     None,
                     app.net.multicall3,
@@ -514,12 +547,16 @@ pub async fn unshield(
         } else {
             Some(msp.claim_tail(recipient))
         };
-        let (change_template, born) = match step.change.as_ref() {
-            Some(change) => {
-                let (note, index) = allocate_note(app, change)?;
-                (Some(note), Some(index))
-            }
-            None => (None, None),
+        let (change_template, born) = if max {
+            (None, None)
+        } else if let Some(change) = step.change.as_ref() {
+            let (note, index) = allocate_note(app, change)?;
+            (Some(note), Some(index))
+        } else {
+            let mut placeholder = step.inputs[0].clone();
+            placeholder.value = Ruint::ZERO;
+            let (note, index) = allocate_note(app, &placeholder)?;
+            (Some(note), Some(index))
         };
         let authorizer = PrivateKeySigner::random();
         let result = msp
@@ -527,6 +564,7 @@ pub async fn unshield(
                 &step.inputs,
                 change_template.as_ref(),
                 want,
+                max,
                 recipient,
                 tail_call,
                 app.net.multicall3,
@@ -1546,6 +1584,57 @@ fn from_r(v: Ruint) -> U256 {
 
 fn fmt(v: U256) -> String {
     alloy::primitives::utils::format_ether(v)
+}
+
+fn fmt_units(v: U256, decimals: u8) -> String {
+    alloy::primitives::utils::format_units(v, decimals).unwrap_or_else(|_| v.to_string())
+}
+
+async fn token_holdings(
+    provider: &impl Provider,
+    tokens: &[Token],
+    account: Address,
+) -> Result<Vec<Held>> {
+    let mut held = Vec::new();
+    for token in tokens {
+        let amount = Erc20Balance::new(token.address, provider)
+            .balanceOf(account)
+            .call()
+            .await?;
+        if !amount.is_zero() {
+            held.push(Held {
+                symbol: token.symbol.clone(),
+                amount,
+                decimals: token.decimals,
+            });
+        }
+    }
+    Ok(held)
+}
+
+fn token_json(held: &[Held]) -> Vec<Value> {
+    held.iter()
+        .map(|h| {
+            json!({
+                "symbol": h.symbol,
+                "amount": h.amount.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn print_token_lines(prefix: &str, held: &[Held]) {
+    for h in held {
+        if prefix.is_empty() {
+            println!("  {}  {}", h.symbol, fmt_units(h.amount, h.decimals));
+        } else {
+            println!(
+                "{prefix}  {}  {}",
+                h.symbol,
+                fmt_units(h.amount, h.decimals)
+            );
+        }
+    }
 }
 
 fn fmt_r(v: Ruint) -> String {

@@ -7,7 +7,7 @@ use std::{
 };
 
 use alloy::{
-    primitives::{Address, keccak256},
+    primitives::{Address, B256, keccak256},
     signers::{
         SignerSync,
         local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English},
@@ -219,14 +219,26 @@ pub fn note_path(index: u32) -> String {
 
 const NOTE_MESSAGE: &[u8] = b"kohaku-hegota private note v1";
 
-/// `spend_key` and `rho` from an EIP-191 signature by `m/8141'/1'/j'`.
+/// Domain byte prepended to the note message, same shape as EIP-7702's `0x05`.
+/// Not `0x05`, and not the EIP-191 personal-sign prefix, so a hardware wallet can
+/// tell this signature apart from a normal message and allow or refuse it.
+const NOTE_MAGIC: u8 = 0x4b;
+
+fn note_digest() -> B256 {
+    let mut preimage = Vec::with_capacity(1 + NOTE_MESSAGE.len());
+    preimage.push(NOTE_MAGIC);
+    preimage.extend_from_slice(NOTE_MESSAGE);
+    keccak256(preimage)
+}
+
+/// `spend_key` and `rho` from a raw secp256k1 signature by `m/8141'/1'/j'`.
 ///
-/// The signature is RFC 6979, so the same key always yields the same note secrets.
-/// A hardware wallet that can `personal_sign` with that key reproduces them.
+/// The signed hash is `keccak256(NOTE_MAGIC || message)`. RFC 6979 makes that
+/// deterministic. A hardware wallet reproduces it by signing that hash, not by `personal_sign`.
 pub fn note_at(mnemonic: &str, index: u32, value: Ruint, chain_id: u64, pool: Address) -> Result<Note> {
     let signer = signer_at(mnemonic, &note_path(index))?;
     let sig = signer
-        .sign_message_sync(NOTE_MESSAGE)
+        .sign_hash_sync(&note_digest())
         .map_err(|e| anyhow::anyhow!("note signature: {e}"))?;
     let bytes = sig.as_bytes();
     Ok(Note {
@@ -269,8 +281,11 @@ fn decode_hex(s: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_wallet, eoa_path, load, note_at, note_path, signer_at, smart_owner_path};
-    use alloy::primitives::address;
+    use super::{
+        NOTE_MAGIC, NOTE_MESSAGE, create_wallet, eoa_path, load, note_at, note_digest, note_path,
+        signer_at, smart_owner_path,
+    };
+    use alloy::{primitives::{address, keccak256}, signers::SignerSync};
     use kohaku_minimal_shield::crypto::P;
     use ruint::aliases::U256 as Ruint;
 
@@ -312,5 +327,15 @@ mod tests {
         assert_ne!(a.spend_key, a.rho);
         assert_ne!(a.spend_key, other.spend_key);
         assert!(a.spend_key < P && a.rho < P);
+
+        let signer = signer_at(phrase, &note_path(0)).unwrap();
+        let personal = signer.sign_message_sync(NOTE_MESSAGE).unwrap();
+        let prefixed = signer.sign_hash_sync(&note_digest()).unwrap();
+        assert_ne!(personal.as_bytes(), prefixed.as_bytes());
+        assert_eq!(note_digest(), {
+            let mut preimage = vec![NOTE_MAGIC];
+            preimage.extend_from_slice(NOTE_MESSAGE);
+            keccak256(preimage)
+        });
     }
 }
