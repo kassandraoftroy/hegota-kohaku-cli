@@ -17,7 +17,7 @@ use kohaku_kv_store::{Store, file::FileStore};
 use kohaku_minimal_shield::{
     Call, Note, PoolProvider, SelectError,
     abis::ShieldedPool,
-    indexer::{Indexer, rpc::RpcSyncer, syncer::SyncerBackend, verifier::Verifier},
+    indexer::{Indexer, rpc::RpcSyncer, verifier::Verifier},
     plan_unshield,
 };
 use ruint::aliases::U256 as Ruint;
@@ -831,7 +831,7 @@ async fn provider_for(app: &App) -> Result<PoolProvider> {
     }
     let store = Store::new(FileStore::open(path)?);
     let pool = chain::pool_of(&app.net);
-    let rpc = RpcSyncer::new(url_provider).with_progress(block_sync_progress("syncing wallet"));
+    let rpc = RpcSyncer::new(url_provider).with_progress(block_sync_progress("syncing wallet", None));
     let indexer = Indexer::new(
         pool,
         store,
@@ -845,7 +845,10 @@ async fn provider_for(app: &App) -> Result<PoolProvider> {
     Ok(PoolProvider::new(indexer))
 }
 
-fn block_sync_progress(label: &'static str) -> impl Fn(u64, u64) + Send + Sync {
+fn block_sync_progress(
+    label: &'static str,
+    start_block: Option<u64>,
+) -> impl Fn(u64, u64) + Send + Sync {
     use std::io::{IsTerminal, Write};
     use std::sync::atomic::{AtomicU8, Ordering};
     let last_pct = AtomicU8::new(255);
@@ -860,7 +863,8 @@ fn block_sync_progress(label: &'static str) -> impl Fn(u64, u64) + Send + Sync {
             let width = 28usize;
             let filled = usize::from(pct) * width / 100;
             let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
-            eprint!("\r{label} [{bar}] {pct:>3}%");
+            let at = start_block.map(|start| format!("  block {}", start.saturating_add(done)));
+            eprint!("\r{label} [{bar}] {pct:>3}%{}", at.unwrap_or_default());
             let _ = stderr.lock().flush();
             if pct == 100 {
                 eprintln!();
@@ -924,10 +928,13 @@ pub async fn hydrate_local_cache(
     let pool = chain::pool_of(net);
     let path = sync_cache::cache_path(root, &net.name);
     let provider = chain::http_provider(rpc);
-    let syncer = RpcSyncer::new(provider).with_progress(block_sync_progress("hydrating cache"));
-    let head = syncer.latest_block(&pool).await?;
+    let head = provider.get_block_number().await?;
     let mut cache = SyncCache::open(&path, pool.chain_id, pool.address, pool.deployed_block)?;
     let from = cache.through().saturating_add(1).max(pool.deployed_block);
+    let syncer = RpcSyncer::new(provider).with_progress(block_sync_progress("hydrating cache", Some(from)));
+    if from <= head && !non_interactive {
+        eprintln!("hydrating cache blocks {from}..={head}");
+    }
     let extended = if from > head {
         Extend::Stored {
             through: cache.through(),

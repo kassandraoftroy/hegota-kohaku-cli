@@ -133,6 +133,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    kohaku_minimal_shield::set_circuit_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/circuit"));
     let cli = Cli::parse();
     if let Command::CreateWallet {
         name,

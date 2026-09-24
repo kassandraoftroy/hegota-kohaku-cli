@@ -1,6 +1,5 @@
 name = "devnet"
 chain_id = 8141
-# approveSender FrameAccountFactory. Accounts from the previous factory cannot self-pay.
 pool = "0xac01c30f28b32dd31d3c2854012e673e74f6b100"
 factory = "0x445f97B761c3F99f0e2F9e6f4ADAfcc98486f5fC"
 multicall3 = "0x6f273b85aa6384dd1e097f46eeae90cc026ce51b"
