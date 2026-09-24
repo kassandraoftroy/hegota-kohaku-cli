@@ -35,6 +35,10 @@ struct Cli {
     non_interactive: bool,
     #[arg(long, global = true, default_value = "devnet")]
     network: String,
+    /// Use a direct HTTP connection instead of Tor.
+    /// Also set when `DISABLE_TOR=1`.
+    #[arg(long, global = true)]
+    without_tor: bool,
     #[arg(long, global = true)]
     broadcast: bool,
     #[command(subcommand)]
@@ -152,7 +156,9 @@ async fn main() -> Result<()> {
         let root = wallet::data_root(cli.data_dir.clone());
         let rpc = chain::rpc_url(cli.rpc_url.clone())?;
         let net = load_network(&cli.network)?;
-        return flow::hydrate_local_cache(&root, &net, rpc, cli.non_interactive).await;
+        chain::warn_if_tor_disabled(cli.without_tor, cli.non_interactive);
+        return flow::hydrate_local_cache(&root, &net, rpc, cli.non_interactive, cli.without_tor)
+            .await;
     }
     if matches!(cli.cmd, Command::ListWallets) {
         let root = wallet::data_root(cli.data_dir);
@@ -281,8 +287,9 @@ async fn create(
         if !cli.non_interactive {
             println!("scanning public accounts and frame accounts");
         }
+        chain::warn_if_tor_disabled(cli.without_tor, cli.non_interactive);
         let rpc = chain::rpc_url(cli.rpc_url.clone())?;
-        let provider = chain::http_provider(rpc);
+        let provider = chain::http_provider(rpc, cli.without_tor).await?;
         let net = load_network(&cli.network)?;
         Some(accounts::scan_imported(&provider, &net, phrase).await?)
     } else {
@@ -339,10 +346,12 @@ async fn open(cli: &Cli) -> Result<App> {
     let password = password(cli, false)?;
     let secrets = wallet::load(&root, &name, &password)?;
     let rpc = chain::rpc_url(cli.rpc_url.clone())?;
+    chain::warn_if_tor_disabled(cli.without_tor, cli.non_interactive);
     Ok(App {
         non_interactive: cli.non_interactive,
         broadcast_flag: cli.broadcast,
         rpc,
+        without_tor: chain::without_tor(cli.without_tor),
         net: load_network(&cli.network)?,
         root,
         name,

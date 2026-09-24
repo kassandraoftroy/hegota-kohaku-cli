@@ -235,7 +235,13 @@ fn note_digest() -> B256 {
 ///
 /// The signed hash is `keccak256(NOTE_MAGIC || message)`. RFC 6979 makes that
 /// deterministic. A hardware wallet reproduces it by signing that hash, not by `personal_sign`.
-pub fn note_at(mnemonic: &str, index: u32, value: Ruint, chain_id: u64, pool: Address) -> Result<Note> {
+pub fn note_at(
+    mnemonic: &str,
+    index: u32,
+    value: Ruint,
+    chain_id: u64,
+    pool: Address,
+) -> Result<Note> {
     let signer = signer_at(mnemonic, &note_path(index))?;
     let sig = signer
         .sign_hash_sync(&note_digest())
@@ -285,7 +291,10 @@ mod tests {
         NOTE_MAGIC, NOTE_MESSAGE, create_wallet, eoa_path, load, note_at, note_digest, note_path,
         signer_at, smart_owner_path,
     };
-    use alloy::{primitives::{address, keccak256}, signers::SignerSync};
+    use alloy::{
+        primitives::{address, keccak256},
+        signers::SignerSync,
+    };
     use kohaku_minimal_shield::crypto::P;
     use ruint::aliases::U256 as Ruint;
 

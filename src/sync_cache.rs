@@ -9,11 +9,11 @@ use std::{
 use alloy::{primitives::Address, providers::Provider};
 use anyhow::{Context, Result, bail};
 use kohaku_minimal_shield::{
+    Pool,
     indexer::{
         rpc::{LoggedEvent, RpcSyncer},
         syncer::{SyncEvent, Syncer, SyncerBackend, SyncerError},
     },
-    Pool,
 };
 use ruint::aliases::U256;
 
@@ -24,6 +24,30 @@ pub const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub fn cache_path(root: &Path, network: &str) -> PathBuf {
     root.join(format!("pool-sync-{network}.bin"))
+}
+
+/// Replace `path` with `bytes` after the existing header checks accept them.
+///
+/// # Errors
+/// Returns when the download is not a cache for this chain and pool.
+pub fn install_download(
+    path: &Path,
+    chain_id: u64,
+    pool: Address,
+    deployed_block: u64,
+    bytes: &[u8],
+) -> Result<()> {
+    let tmp = path.with_extension("bin.part");
+    fs::write(&tmp, bytes).with_context(|| format!("{}", tmp.display()))?;
+    match SyncCache::open(&tmp, chain_id, pool, deployed_block) {
+        Ok(cache) => drop(cache),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+    }
+    fs::rename(&tmp, path).with_context(|| format!("{}", path.display()))?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +137,11 @@ impl SyncCache {
 
     pub fn through(&self) -> u64 {
         self.header.through
+    }
+
+    /// No block at or after the pool's deploy block is stored yet.
+    pub fn is_empty(&self) -> bool {
+        self.header.through < self.deployed_block
     }
 
     pub fn len_bytes(&self) -> u64 {
@@ -436,7 +465,7 @@ fn take_u256(buf: &[u8], i: &mut usize) -> Result<U256> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Extend, SyncCache, MAX_CACHE_BYTES};
+    use super::{Extend, MAX_CACHE_BYTES, SyncCache};
     use alloy::primitives::address;
     use kohaku_minimal_shield::indexer::{rpc::LoggedEvent, syncer::SyncEvent};
     use ruint::aliases::U256;
@@ -466,12 +495,17 @@ mod tests {
             },
         };
         assert!(matches!(
-            cache.extend(100, 101, &[leaf.clone(), spent.clone()]).unwrap(),
+            cache
+                .extend(100, 101, &[leaf.clone(), spent.clone()])
+                .unwrap(),
             Extend::Stored { through: 101 }
         ));
         let events = cache.events_through(100, 100).unwrap();
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], SyncEvent::LeafAppended { index: 3, .. }));
+        assert!(matches!(
+            events[0],
+            SyncEvent::LeafAppended { index: 3, .. }
+        ));
         assert_eq!(cache.spent_through(101).unwrap(), vec![U256::from(9u64)]);
 
         let tiny = SyncCache::open_limited(&path, 8141, pool, 100, cache.len_bytes()).unwrap();
@@ -496,7 +530,12 @@ mod tests {
             Extend::Stored { through: 101 }
         ));
         assert_eq!(tiny.through(), 101);
-        assert!(tiny.spent_through(500).unwrap().iter().all(|nf| *nf != U256::from(7u64)));
+        assert!(
+            tiny.spent_through(500)
+                .unwrap()
+                .iter()
+                .all(|nf| *nf != U256::from(7u64))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

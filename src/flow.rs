@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use crate::{
     accounts::{self, Eoa, Smart},
     chain::{self, Network, Token},
-    txbuild::{self, APPROVE_EXEC, APPROVE_STATE, OutCall},
     sync_cache::{self, Extend, SyncCache},
+    txbuild::{self, APPROVE_EXEC, APPROVE_STATE, OutCall},
     wallet::{self, SavedNote, Secrets},
 };
 
@@ -35,11 +35,18 @@ pub struct App {
     pub non_interactive: bool,
     pub broadcast_flag: bool,
     pub rpc: reqwest::Url,
+    pub without_tor: bool,
     pub net: Network,
     pub root: std::path::PathBuf,
     pub name: String,
     pub password: String,
     pub secrets: Secrets,
+}
+
+impl App {
+    async fn provider(&self) -> Result<impl Provider + Clone + use<>> {
+        chain::http_provider(self.rpc.clone(), self.without_tor).await
+    }
 }
 
 #[derive(Clone)]
@@ -65,10 +72,21 @@ struct Held {
 }
 
 pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
-    let provider = chain::http_provider(app.rpc.clone());
+    let provider = app.provider().await?;
     sync_notes(app, &provider).await?;
-    let eoas = accounts::load_eoas(&provider, &app.secrets).await?;
-    let smart = accounts::load_smart(&provider, &app.net, &app.secrets).await?;
+    let report = block_sync_progress("syncing public addresses", None);
+    let mut done = 0u64;
+    let mut total = estimate_public_rpc_steps(app);
+    report(0, total.max(1));
+    let mut tick = || {
+        done += 1;
+        if done > total {
+            total = done;
+        }
+        report(done, total.max(1));
+    };
+    let eoas = accounts::load_eoas(&provider, &app.secrets, &mut tick).await?;
+    let smart = accounts::load_smart(&provider, &app.net, &app.secrets, &mut tick).await?;
     let public: U256 = eoas
         .iter()
         .map(|e| e.balance)
@@ -82,11 +100,16 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
         .fold(Ruint::ZERO, |a, n| a + n.note.value);
     let mut eoa_tokens = Vec::with_capacity(eoas.len());
     for e in &eoas {
-        eoa_tokens.push(token_holdings(&provider, &app.net.tokens, e.signer.address()).await?);
+        eoa_tokens.push(
+            token_holdings(&provider, &app.net.tokens, e.signer.address(), &mut tick).await?,
+        );
     }
     let mut smart_tokens = Vec::with_capacity(smart.len());
     for s in &smart {
-        smart_tokens.push(token_holdings(&provider, &app.net.tokens, s.account).await?);
+        smart_tokens.push(token_holdings(&provider, &app.net.tokens, s.account, &mut tick).await?);
+    }
+    if done < total {
+        report(total, total.max(1));
     }
     if app.non_interactive {
         println!(
@@ -122,7 +145,10 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
     println!("Private ETH: {}", fmt_r(private));
     if !verbose {
         for (e, tokens) in eoas.iter().zip(&eoa_tokens) {
-            print_token_lines(&format!("EOA {}  {:#x}", e.index, e.signer.address()), tokens);
+            print_token_lines(
+                &format!("EOA {}  {:#x}", e.index, e.signer.address()),
+                tokens,
+            );
         }
         for (s, tokens) in smart.iter().zip(&smart_tokens) {
             print_token_lines(&format!("a{}  {:#x}", s.index, s.account), tokens);
@@ -318,7 +344,7 @@ pub async fn shield(
     if chain != app.net.chain_id {
         bail!("rpc chain {chain} != profile {}", app.net.chain_id);
     }
-    let provider = chain::http_provider(app.rpc.clone());
+    let provider = app.provider().await?;
     let epoch = ShieldedPool::new(app.net.pool, &provider)
         .currentEpoch()
         .call()
@@ -382,7 +408,7 @@ pub async fn unshield(
     max: bool,
     tail: Option<String>,
 ) -> Result<()> {
-    let provider = chain::http_provider(app.rpc.clone());
+    let provider = app.provider().await?;
     sync_notes(app, &provider).await?;
     let notes: Vec<Note> = app
         .secrets
@@ -634,7 +660,8 @@ pub async fn unshield(
 async fn load_one_smart(app: &App, provider: &impl Provider, j: u32) -> Result<Smart> {
     chain::require_factory(&app.net)?;
     let owner = accounts::smart_owner(&app.secrets, j)?;
-    let account = accounts::predict_account(provider, app.net.acct_factory, owner.address()).await?;
+    let account =
+        accounts::predict_account(provider, app.net.acct_factory, owner.address()).await?;
     let code = provider.get_code_at(account).await?;
     let balance = provider.get_balance(account).await?;
     Ok(Smart {
@@ -766,7 +793,7 @@ async fn published_slot(app: &App, provider: &impl Provider, epoch: u64) -> Resu
 
 async fn publish_root(app: &App, from: &Picked) -> Result<u64> {
     let from = refresh_balance(app, from).await?;
-    let provider = chain::http_provider(app.rpc.clone());
+    let provider = app.provider().await?;
     let epoch = ShieldedPool::new(app.net.pool, &provider)
         .currentEpoch()
         .call()
@@ -824,14 +851,16 @@ async fn publish_for(
 }
 
 async fn provider_for(app: &App) -> Result<PoolProvider> {
-    let url_provider = chain::http_provider(app.rpc.clone());
+    let url_provider = app.provider().await?;
     let path = chain::indexer_path(&app.root, &app.name, &app.net.name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let store = Store::new(FileStore::open(path)?);
     let pool = chain::pool_of(&app.net);
-    let rpc = RpcSyncer::new(url_provider).with_progress(block_sync_progress("syncing wallet", None));
+    let rpc =
+        RpcSyncer::new(url_provider)
+            .with_progress(block_sync_progress("syncing shielded pool", None));
     let indexer = Indexer::new(
         pool,
         store,
@@ -845,6 +874,17 @@ async fn provider_for(app: &App) -> Result<PoolProvider> {
     Ok(PoolProvider::new(indexer))
 }
 
+fn estimate_public_rpc_steps(app: &App) -> u64 {
+    let tokens = app.net.tokens.len() as u64;
+    let eoas = app.secrets.public_indexes.len() as u64;
+    let smart_hi = app.secrets.smart_indexes.iter().copied().max().unwrap_or(0);
+    let smart_checks = u64::from(smart_hi.saturating_add(8)) + 1;
+    let kept = app.secrets.smart_indexes.len() as u64;
+    // EOA: balance. Smart scan: predict + code per slot; kept slots also balance.
+    // Then balanceOf for each token on each EOA and kept smart account.
+    eoas * (1 + tokens) + smart_checks * 2 + kept * (1 + tokens)
+}
+
 fn block_sync_progress(
     label: &'static str,
     start_block: Option<u64>,
@@ -852,10 +892,19 @@ fn block_sync_progress(
     use std::io::{IsTerminal, Write};
     use std::sync::atomic::{AtomicU8, Ordering};
     let last_pct = AtomicU8::new(255);
+    let tick = std::sync::Mutex::new(std::time::Instant::now());
     move |done, total| {
+        let batch = tick
+            .lock()
+            .map(|mut tick| {
+                let took = tick.elapsed();
+                *tick = std::time::Instant::now();
+                took
+            })
+            .unwrap_or_default();
         let pct = u8::try_from((done.saturating_mul(100) / total.max(1)).min(100)).unwrap_or(100);
         let prev = last_pct.swap(pct, Ordering::Relaxed);
-        if prev == pct {
+        if prev == pct && batch.as_millis() < 50 {
             return;
         }
         let stderr = std::io::stderr();
@@ -864,18 +913,74 @@ fn block_sync_progress(
             let filled = usize::from(pct) * width / 100;
             let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
             let at = start_block.map(|start| format!("  block {}", start.saturating_add(done)));
-            eprint!("\r{label} [{bar}] {pct:>3}%{}", at.unwrap_or_default());
+            eprint!(
+                "\r{label} [{bar}] {pct:>3}%{}  batch {:.1}s",
+                at.unwrap_or_default(),
+                batch.as_secs_f64()
+            );
             let _ = stderr.lock().flush();
             if pct == 100 {
                 eprintln!();
             }
-        } else if pct == 100 || prev == 255 || pct / 10 != prev / 10 {
-            eprintln!("{label} {pct}%");
+        } else {
+            eprintln!("{label} {pct}% batch {:.1}s", batch.as_secs_f64());
         }
     }
 }
 
+async fn seed_event_cache(root: &std::path::Path, net: &Network, without_tor: bool) {
+    let Ok(raw) = std::env::var("EVENT_CACHE_ENDPOINT") else {
+        return;
+    };
+    let path = sync_cache::cache_path(root, &net.name);
+    if path.exists() {
+        match SyncCache::open(&path, net.chain_id, net.pool, net.deployed_block) {
+            Ok(cache) if !cache.is_empty() => return,
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("event cache not replaced: {err}");
+                return;
+            }
+        }
+    }
+    let Ok(url) = raw.parse::<reqwest::Url>() else {
+        eprintln!("EVENT_CACHE_ENDPOINT is not a url");
+        return;
+    };
+    eprintln!("downloading event cache");
+    let started = std::time::Instant::now();
+    let bytes = if chain::without_tor(without_tor) {
+        match reqwest::get(url).await {
+            Ok(resp) => match resp.bytes().await {
+                Ok(bytes) => Ok(bytes.to_vec()),
+                Err(err) => Err(anyhow::anyhow!(err)),
+            },
+            Err(err) => Err(anyhow::anyhow!(err)),
+        }
+    } else {
+        match chain::tor_session().await {
+            Ok(tor) => tor.get(&url).await,
+            Err(err) => Err(err),
+        }
+    };
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("event cache download failed: {err}");
+            return;
+        }
+    };
+    match sync_cache::install_download(&path, net.chain_id, net.pool, net.deployed_block, &bytes) {
+        Ok(()) => eprintln!(
+            "event cache saved in {:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+        Err(err) => eprintln!("event cache download rejected: {err}"),
+    }
+}
+
 async fn sync_notes(app: &mut App, provider: &impl Provider) -> Result<()> {
+    seed_event_cache(&app.root, &app.net, app.without_tor).await;
     let msp = provider_for(app).await?;
     msp.indexer.sync().await?;
     let epoch = ShieldedPool::new(app.net.pool, provider)
@@ -921,17 +1026,20 @@ pub async fn hydrate_local_cache(
     net: &Network,
     rpc: reqwest::Url,
     non_interactive: bool,
+    without_tor: bool,
 ) -> Result<()> {
     if net.pool.is_zero() {
         bail!("this network has no pool");
     }
+    seed_event_cache(root, net, without_tor).await;
     let pool = chain::pool_of(net);
     let path = sync_cache::cache_path(root, &net.name);
-    let provider = chain::http_provider(rpc);
+    let provider = chain::http_provider(rpc, without_tor).await?;
     let head = provider.get_block_number().await?;
     let mut cache = SyncCache::open(&path, pool.chain_id, pool.address, pool.deployed_block)?;
     let from = cache.through().saturating_add(1).max(pool.deployed_block);
-    let syncer = RpcSyncer::new(provider).with_progress(block_sync_progress("hydrating cache", Some(from)));
+    let syncer =
+        RpcSyncer::new(provider).with_progress(block_sync_progress("hydrating cache", Some(from)));
     if from <= head && !non_interactive {
         eprintln!("hydrating cache blocks {from}..={head}");
     }
@@ -978,7 +1086,12 @@ async fn spent_nullifiers(
     let mut from = app.net.deployed_block;
     let mut out = std::collections::HashSet::new();
     if path.exists() {
-        let mut cache = SyncCache::open(&path, app.net.chain_id, app.net.pool, app.net.deployed_block)?;
+        let mut cache = SyncCache::open(
+            &path,
+            app.net.chain_id,
+            app.net.pool,
+            app.net.deployed_block,
+        )?;
         let through = cache.through();
         for nf in cache.spent_through(through)? {
             out.insert(nf);
@@ -1012,9 +1125,9 @@ fn index_from_path(path: &[u8]) -> u64 {
 }
 
 async fn pick_from(app: &App, spec: Option<&str>, must_pay: bool) -> Result<Picked> {
-    let provider = chain::http_provider(app.rpc.clone());
-    let eoas = accounts::load_eoas(&provider, &app.secrets).await?;
-    let smart = accounts::load_smart(&provider, &app.net, &app.secrets).await?;
+    let provider = app.provider().await?;
+    let eoas = accounts::load_eoas(&provider, &app.secrets, || {}).await?;
+    let smart = accounts::load_smart(&provider, &app.net, &app.secrets, || {}).await?;
     if let Some(spec) = spec {
         return picked_from_spec(&eoas, &smart, spec);
     }
@@ -1105,7 +1218,7 @@ async fn pick_to(
     if let Some(spec) = to {
         if let Some(rest) = spec.strip_prefix('a') {
             let j: u32 = rest.parse().context("aN")?;
-            let provider = chain::http_provider(app.rpc.clone());
+            let provider = app.provider().await?;
             let smart = load_one_smart(app, &provider, j).await?;
             if deployed_smart_only && !smart.deployed {
                 bail!(
@@ -1557,7 +1670,7 @@ async fn make_publish_tx(
 }
 
 async fn refresh_balance(app: &App, from: &Picked) -> Result<Picked> {
-    let provider = chain::http_provider(app.rpc.clone());
+    let provider = app.provider().await?;
     let mut next = from.clone();
     next.balance = provider.get_balance(from.address).await?;
     Ok(next)
@@ -1669,6 +1782,7 @@ async fn token_holdings(
     provider: &impl Provider,
     tokens: &[Token],
     account: Address,
+    mut on_rpc: impl FnMut(),
 ) -> Result<Vec<Held>> {
     let mut held = Vec::new();
     for token in tokens {
@@ -1676,6 +1790,7 @@ async fn token_holdings(
             .balanceOf(account)
             .call()
             .await?;
+        on_rpc();
         if !amount.is_zero() {
             held.push(Held {
                 symbol: token.symbol.clone(),
@@ -1721,7 +1836,7 @@ mod tests {
     use super::{atomic_rejected, max_withdrawable, rejects_atomic_flag, ru64};
     use alloy::primitives::Address;
     use kohaku_frametx_kit::SimulateResult;
-    use kohaku_minimal_shield::{plan_unshield, Note};
+    use kohaku_minimal_shield::{Note, plan_unshield};
 
     fn sim(valid: Option<bool>, violation: Option<&str>) -> SimulateResult {
         SimulateResult {

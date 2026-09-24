@@ -5,11 +5,14 @@ use std::path::PathBuf;
 use alloy::{
     primitives::Address,
     providers::{Provider, ProviderBuilder},
+    rpc::client::RpcClient,
 };
 use anyhow::{Context, Result, bail};
 use kohaku_frametx_kit::FrameTxClient;
 use kohaku_minimal_shield::Pool;
+use kohaku_tor_rpc::TorRpc;
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 
 #[derive(Debug, Clone)]
 pub struct Network {
@@ -121,8 +124,30 @@ pub fn frame_client(url: &reqwest::Url) -> FrameTxClient {
     FrameTxClient::new(url.clone())
 }
 
-pub fn http_provider(url: reqwest::Url) -> impl Provider + Clone {
-    ProviderBuilder::new().connect_http(url)
+static TOR: OnceCell<TorRpc> = OnceCell::const_new();
+
+pub async fn tor_session() -> Result<&'static TorRpc> {
+    TOR.get_or_try_init(TorRpc::connect).await
+}
+
+pub fn without_tor(flag: bool) -> bool {
+    flag || std::env::var("DISABLE_TOR").ok().as_deref() == Some("1")
+}
+
+/// Interactive runs print a warning when Tor is off.
+pub fn warn_if_tor_disabled(flag: bool, non_interactive: bool) {
+    if !non_interactive && without_tor(flag) {
+        eprintln!("warning: tor is disabled");
+    }
+}
+
+pub async fn http_provider(url: reqwest::Url, without_tor_flag: bool) -> Result<impl Provider + Clone> {
+    let client = if without_tor(without_tor_flag) {
+        RpcClient::new_http(url)
+    } else {
+        tor_session().await?.rpc_client(url)?
+    };
+    Ok(ProviderBuilder::new().connect_client(client))
 }
 
 pub fn indexer_path(data_dir: &std::path::Path, wallet: &str, network: &str) -> PathBuf {

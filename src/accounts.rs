@@ -62,11 +62,16 @@ pub async fn predict_account(
     Ok(addr)
 }
 
-pub async fn load_eoas(provider: &impl Provider, secrets: &Secrets) -> Result<Vec<Eoa>> {
+pub async fn load_eoas(
+    provider: &impl Provider,
+    secrets: &Secrets,
+    mut on_rpc: impl FnMut(),
+) -> Result<Vec<Eoa>> {
     let mut out = Vec::new();
     for index in &secrets.public_indexes {
         let signer = eoa_signer(secrets, *index)?;
         let balance = provider.get_balance(signer.address()).await?;
+        on_rpc();
         out.push(Eoa {
             index: *index,
             signer,
@@ -80,6 +85,7 @@ pub async fn load_smart(
     provider: &impl Provider,
     net: &Network,
     secrets: &Secrets,
+    mut on_rpc: impl FnMut(),
 ) -> Result<Vec<Smart>> {
     if net.acct_factory.is_zero() {
         return Ok(Vec::new());
@@ -96,10 +102,13 @@ pub async fn load_smart(
         }
         let owner = smart_owner(secrets, j)?;
         let account = predict_account(provider, net.acct_factory, owner.address()).await?;
+        on_rpc();
         let code = provider.get_code_at(account).await?;
+        on_rpc();
         let deployed = !code.is_empty();
         if deployed || seen.contains(&j) {
             let balance = provider.get_balance(account).await?;
+            on_rpc();
             out.push(Smart {
                 index: j,
                 owner,
