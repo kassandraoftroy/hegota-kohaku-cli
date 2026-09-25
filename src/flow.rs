@@ -190,6 +190,7 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
 
     if verbose {
         // 3. Address-by-address (ETH labeled).
+        crate::ui::print_section("Public breakdown");
         for (e, tokens) in eoas.iter().zip(&eoa_tokens) {
             crate::ui::print_section(&format!("EOA {}  {:#x}", e.index, e.signer.address()));
             let mut rows = vec![vec!["ETH".into(), fmt(e.balance)]];
@@ -215,7 +216,7 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
         }
 
         // 4. Notes.
-        crate::ui::print_section("Notes");
+        crate::ui::print_section("Private Breakdown");
         let note_rows: Vec<Vec<String>> = app
             .secrets
             .notes
