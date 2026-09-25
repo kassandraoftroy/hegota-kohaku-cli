@@ -56,6 +56,56 @@ pub fn print_box(text: &str) {
     println!("{bottom}");
 }
 
+/// stderr progress bar: `label [####] pct%  done/total  last Xs`.
+///
+/// `start_block` adds `block N` when set (shielded-pool / hydrate).
+pub fn block_sync_progress(
+    label: &'static str,
+    start_block: Option<u64>,
+) -> impl Fn(u64, u64) + Send + Sync {
+    use std::io::{IsTerminal, Write};
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let last_pct = AtomicU8::new(255);
+    let tick = std::sync::Mutex::new(std::time::Instant::now());
+    move |done, total| {
+        let last = tick
+            .lock()
+            .map(|mut tick| {
+                let took = tick.elapsed();
+                *tick = std::time::Instant::now();
+                took
+            })
+            .unwrap_or_default();
+        let total = total.max(1);
+        let pct = u8::try_from((done.saturating_mul(100) / total).min(100)).unwrap_or(100);
+        let prev = last_pct.swap(pct, Ordering::Relaxed);
+        if prev == pct && last.as_millis() < 50 {
+            return;
+        }
+        let stderr = std::io::stderr();
+        if stderr.is_terminal() {
+            let width = 28usize;
+            let filled = usize::from(pct) * width / 100;
+            let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
+            let at = start_block.map(|start| format!("  block {}", start.saturating_add(done)));
+            eprint!(
+                "\r{label} [{bar}] {pct:>3}%  {done}/{total}{}  last {:.1}s",
+                at.unwrap_or_default(),
+                last.as_secs_f64()
+            );
+            let _ = stderr.lock().flush();
+            if pct == 100 {
+                eprintln!();
+            }
+        } else {
+            eprintln!(
+                "{label} {pct}%  {done}/{total}  last {:.1}s",
+                last.as_secs_f64()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

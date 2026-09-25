@@ -4,7 +4,6 @@ use alloy::{
     primitives::{Address, B256, Bytes, U256, utils::parse_units},
     providers::Provider,
     signers::local::PrivateKeySigner,
-    sol,
     sol_types::SolEvent,
 };
 use anyhow::{Context, Result, bail};
@@ -25,7 +24,7 @@ use serde_json::{Value, json};
 
 use crate::{
     accounts::{self, Eoa, Smart},
-    chain::{self, Network, Token},
+    chain::{self, Network},
     sync_cache::{self, Extend, SyncCache},
     txbuild::{self, APPROVE_EXEC, APPROVE_STATE, OutCall},
     wallet::{self, SavedNote, Secrets},
@@ -58,13 +57,6 @@ struct Picked {
     smart: Option<Smart>,
 }
 
-sol! {
-    #[sol(rpc)]
-    interface Erc20Balance {
-        function balanceOf(address account) external view returns (uint256);
-    }
-}
-
 struct Held {
     symbol: String,
     amount: U256,
@@ -85,8 +77,47 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
         }
         report(done, total.max(1));
     };
-    let eoas = accounts::load_eoas(&provider, &app.secrets, &mut tick).await?;
-    let smart = accounts::load_smart(&provider, &app.net, &app.secrets, &mut tick).await?;
+    let (eoas, eoa_token_amts) = accounts::load_eoas(
+        app.rpc.clone(),
+        app.without_tor,
+        &app.secrets,
+        &app.net.tokens,
+        &mut tick,
+    )
+    .await?;
+    let (smart, smart_token_amts) = accounts::load_smart(
+        app.rpc.clone(),
+        app.without_tor,
+        &app.net,
+        &app.secrets,
+        &app.net.tokens,
+        &mut tick,
+    )
+    .await?;
+    let eoa_tokens: Vec<Vec<Held>> = eoa_token_amts
+        .into_iter()
+        .map(|list| {
+            list.into_iter()
+                .map(|t| Held {
+                    symbol: t.symbol,
+                    amount: t.amount,
+                    decimals: t.decimals,
+                })
+                .collect()
+        })
+        .collect();
+    let smart_tokens: Vec<Vec<Held>> = smart_token_amts
+        .into_iter()
+        .map(|list| {
+            list.into_iter()
+                .map(|t| Held {
+                    symbol: t.symbol,
+                    amount: t.amount,
+                    decimals: t.decimals,
+                })
+                .collect()
+        })
+        .collect();
     let public: U256 = eoas
         .iter()
         .map(|e| e.balance)
@@ -98,16 +129,6 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
         .iter()
         .filter(|n| !n.pending)
         .fold(Ruint::ZERO, |a, n| a + n.note.value);
-    let mut eoa_tokens = Vec::with_capacity(eoas.len());
-    for e in &eoas {
-        eoa_tokens.push(
-            token_holdings(&provider, &app.net.tokens, e.signer.address(), &mut tick).await?,
-        );
-    }
-    let mut smart_tokens = Vec::with_capacity(smart.len());
-    for s in &smart {
-        smart_tokens.push(token_holdings(&provider, &app.net.tokens, s.account, &mut tick).await?);
-    }
     // Close on real work (no fake snap to an overestimate).
     report(done.max(1), done.max(1));
     if app.non_interactive {
@@ -493,16 +514,22 @@ pub async fn unshield(
     let mut remember_public: Option<u32> = None;
     let (recipient, smart_for_tail) = if tail_calls.is_some() {
         let smart = if next {
-            accounts::next_free_smart(&provider, &app.net, &app.secrets).await?
+            accounts::next_free_smart(
+                app.rpc.clone(),
+                app.without_tor,
+                &app.net,
+                &app.secrets,
+            )
+            .await?
         } else {
             match to.as_deref() {
                 Some(spec) if spec.starts_with('a') => {
                     let j: u32 = spec[1..].parse().context("smart selector")?;
-                    load_one_smart(app, &provider, j).await?
+                    load_one_smart(app, j).await?
                 }
                 Some(_) => bail!("--tail-calls needs --next or --to aN"),
                 None if app.non_interactive => bail!("--tail-calls needs --next or --to aN"),
-                None => prompt_tail_account(app, &provider).await?,
+                None => prompt_tail_account(app).await?,
             }
         };
         remember_smart = Some(smart.index);
@@ -692,20 +719,15 @@ pub async fn unshield(
     Ok(())
 }
 
-async fn load_one_smart(app: &App, provider: &impl Provider, j: u32) -> Result<Smart> {
-    chain::require_factory(&app.net)?;
-    let owner = accounts::smart_owner(&app.secrets, j)?;
-    let account =
-        accounts::predict_account(provider, app.net.acct_factory, owner.address()).await?;
-    let code = provider.get_code_at(account).await?;
-    let balance = provider.get_balance(account).await?;
-    Ok(Smart {
-        index: j,
-        owner,
-        account,
-        deployed: !code.is_empty(),
-        balance,
-    })
+async fn load_one_smart(app: &App, j: u32) -> Result<Smart> {
+    accounts::load_one_smart(
+        app.rpc.clone(),
+        app.without_tor,
+        &app.net,
+        &app.secrets,
+        j,
+    )
+    .await
 }
 
 fn allocate_note(app: &mut App, template: &Note) -> Result<(Note, u32)> {
@@ -943,47 +965,7 @@ fn block_sync_progress(
     label: &'static str,
     start_block: Option<u64>,
 ) -> impl Fn(u64, u64) + Send + Sync {
-    use std::io::{IsTerminal, Write};
-    use std::sync::atomic::{AtomicU8, Ordering};
-    let last_pct = AtomicU8::new(255);
-    let tick = std::sync::Mutex::new(std::time::Instant::now());
-    move |done, total| {
-        let last = tick
-            .lock()
-            .map(|mut tick| {
-                let took = tick.elapsed();
-                *tick = std::time::Instant::now();
-                took
-            })
-            .unwrap_or_default();
-        let total = total.max(1);
-        let pct = u8::try_from((done.saturating_mul(100) / total).min(100)).unwrap_or(100);
-        let prev = last_pct.swap(pct, Ordering::Relaxed);
-        if prev == pct && last.as_millis() < 50 {
-            return;
-        }
-        let stderr = std::io::stderr();
-        if stderr.is_terminal() {
-            let width = 28usize;
-            let filled = usize::from(pct) * width / 100;
-            let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
-            let at = start_block.map(|start| format!("  block {}", start.saturating_add(done)));
-            eprint!(
-                "\r{label} [{bar}] {pct:>3}%  {done}/{total}{}  last {:.1}s",
-                at.unwrap_or_default(),
-                last.as_secs_f64()
-            );
-            let _ = stderr.lock().flush();
-            if pct == 100 {
-                eprintln!();
-            }
-        } else {
-            eprintln!(
-                "{label} {pct}%  {done}/{total}  last {:.1}s",
-                last.as_secs_f64()
-            );
-        }
-    }
+    crate::ui::block_sync_progress(label, start_block)
 }
 
 async fn seed_event_cache(root: &std::path::Path, net: &Network, without_tor: bool) {
@@ -1183,9 +1165,23 @@ fn index_from_path(path: &[u8]) -> u64 {
 }
 
 async fn pick_from(app: &App, spec: Option<&str>, must_pay: bool) -> Result<Picked> {
-    let provider = app.provider().await?;
-    let eoas = accounts::load_eoas(&provider, &app.secrets, || {}).await?;
-    let smart = accounts::load_smart(&provider, &app.net, &app.secrets, || {}).await?;
+    let (eoas, _) = accounts::load_eoas(
+        app.rpc.clone(),
+        app.without_tor,
+        &app.secrets,
+        &[],
+        || {},
+    )
+    .await?;
+    let (smart, _) = accounts::load_smart(
+        app.rpc.clone(),
+        app.without_tor,
+        &app.net,
+        &app.secrets,
+        &[],
+        || {},
+    )
+    .await?;
     if let Some(spec) = spec {
         return picked_from_spec(&eoas, &smart, spec);
     }
@@ -1276,8 +1272,7 @@ async fn pick_to(
     if let Some(spec) = to {
         if let Some(rest) = spec.strip_prefix('a') {
             let j: u32 = rest.parse().context("aN")?;
-            let provider = app.provider().await?;
-            let smart = load_one_smart(app, &provider, j).await?;
+            let smart = load_one_smart(app, j).await?;
             if deployed_smart_only && !smart.deployed {
                 bail!(
                     "a{j} is not deployed. Plain unshield needs a deployed account. Use --tail-calls to create it."
@@ -1728,26 +1723,36 @@ async fn make_publish_tx(
 }
 
 async fn refresh_balance(app: &App, from: &Picked) -> Result<Picked> {
-    let provider = app.provider().await?;
+    let address = from.address;
+    let balance = chain::with_isolated_provider(app.rpc.clone(), app.without_tor, |provider| async move {
+        Ok(provider.get_balance(address).await?)
+    })
+    .await?;
     let mut next = from.clone();
-    next.balance = provider.get_balance(from.address).await?;
+    next.balance = balance;
     Ok(next)
 }
 
-async fn prompt_tail_account(app: &App, provider: &impl Provider) -> Result<Smart> {
+async fn prompt_tail_account(app: &App) -> Result<Smart> {
     let choice = Select::new()
         .with_prompt("Smart account for the tail")
         .items(&["Next free aN", "Existing aN"])
         .interact()?;
     if choice == 0 {
-        return accounts::next_free_smart(provider, &app.net, &app.secrets).await;
+        return accounts::next_free_smart(
+            app.rpc.clone(),
+            app.without_tor,
+            &app.net,
+            &app.secrets,
+        )
+        .await;
     }
     let entered: String = Input::new().with_prompt("Selector (aN)").interact_text()?;
     let rest = entered
         .strip_prefix('a')
         .context("use aN, for example a0")?;
     let j: u32 = rest.parse().context("smart selector")?;
-    load_one_smart(app, provider, j).await
+    load_one_smart(app, j).await
 }
 
 fn path_name(picked: &Picked) -> &'static str {
@@ -1834,30 +1839,6 @@ fn fmt(v: U256) -> String {
 
 fn fmt_units(v: U256, decimals: u8) -> String {
     alloy::primitives::utils::format_units(v, decimals).unwrap_or_else(|_| v.to_string())
-}
-
-async fn token_holdings(
-    provider: &impl Provider,
-    tokens: &[Token],
-    account: Address,
-    mut on_rpc: impl FnMut(),
-) -> Result<Vec<Held>> {
-    let mut held = Vec::new();
-    for token in tokens {
-        let amount = Erc20Balance::new(token.address, provider)
-            .balanceOf(account)
-            .call()
-            .await?;
-        on_rpc();
-        if !amount.is_zero() {
-            held.push(Held {
-                symbol: token.symbol.clone(),
-                amount,
-                decimals: token.decimals,
-            });
-        }
-    }
-    Ok(held)
 }
 
 fn token_json(held: &[Held]) -> Vec<Value> {

@@ -290,9 +290,20 @@ async fn create(
         }
         chain::warn_if_tor_disabled(cli.without_tor, cli.non_interactive);
         let rpc = chain::rpc_url(cli.rpc_url.clone())?;
-        let provider = chain::http_provider(rpc, cli.without_tor).await?;
         let net = load_network(&cli.network)?;
-        Some(accounts::scan_imported(&provider, &net, phrase).await?)
+        let report = if cli.non_interactive {
+            None
+        } else {
+            Some(crate::ui::block_sync_progress("scanning accounts", None))
+        };
+        Some(
+            accounts::scan_imported(rpc, cli.without_tor, &net, phrase, |done, total| {
+                if let Some(report) = &report {
+                    report(done, total);
+                }
+            })
+            .await?,
+        )
     } else {
         None
     };

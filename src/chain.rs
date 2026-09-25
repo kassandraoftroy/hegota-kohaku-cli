@@ -1,10 +1,10 @@
 //! Network profile and RPC helpers. The only HTTP endpoint is the Ethereum RPC.
 
-use std::path::PathBuf;
+use std::{future::Future, path::PathBuf};
 
 use alloy::{
     primitives::Address,
-    providers::{Provider, ProviderBuilder},
+    providers::{Provider, ProviderBuilder, RootProvider},
     rpc::client::RpcClient,
 };
 use anyhow::{Context, Result, bail};
@@ -141,13 +141,32 @@ pub fn warn_if_tor_disabled(flag: bool, non_interactive: bool) {
     }
 }
 
+/// Shared-circuit provider for pool sync / long-lived reads.
 pub async fn http_provider(url: reqwest::Url, without_tor_flag: bool) -> Result<impl Provider + Clone> {
     let client = if without_tor(without_tor_flag) {
         RpcClient::new_http(url)
     } else {
-        tor_session().await?.rpc_client(url)?
+        tor_session().await?.shared_rpc_client(url)?
     };
     Ok(ProviderBuilder::new().connect_client(client))
+}
+
+/// Run `f` on a short-lived provider that uses one Tor isolation session (or clearnet).
+pub async fn with_isolated_provider<F, Fut, T>(
+    url: reqwest::Url,
+    without_tor_flag: bool,
+    f: F,
+) -> Result<T>
+where
+    F: FnOnce(RootProvider) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let client = if without_tor(without_tor_flag) {
+        RpcClient::new_http(url)
+    } else {
+        tor_session().await?.isolated_rpc_client(url)?
+    };
+    f(RootProvider::new(client)).await
 }
 
 pub fn indexer_path(data_dir: &std::path::Path, wallet: &str, network: &str) -> PathBuf {
