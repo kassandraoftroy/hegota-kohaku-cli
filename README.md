@@ -1,6 +1,6 @@
 # hegota-kohaku-cli
 
-a cli that mirors the functionality of kohaku-cli but works with hegota EIPs and a new ETH mixer that integrates the hegota EIPs
+a cli that mirors the functionality of kohaku-cli but works with hegota EIPs and a new ETH shielded pool design (that integrates those hegota EIPs)
 
 ## setup
 
