@@ -324,9 +324,8 @@ async fn create(
             body["smartScanned"] = serde_json::json!(smart_scanned);
         }
         println!("{body}");
-    } else {
-        println!("wallet {name} created. Write this phrase down; it is not shown again.");
-        crate::ui::print_box(&phrase);
+    } else if imported.is_some() {
+        println!("wallet {name} created from imported mnemonic.");
         if let Some((accounts, smart_scanned)) = &found {
             println!(
                 "stored public indexes {}",
@@ -341,6 +340,9 @@ async fn create(
                 println!("frame accounts were not scanned; this network has no factory");
             }
         }
+    } else {
+        println!("wallet {name} created. Write this phrase down; it is not shown again.");
+        crate::ui::print_box(&phrase);
     }
     Ok(())
 }
