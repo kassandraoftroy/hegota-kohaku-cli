@@ -326,7 +326,7 @@ mod tests {
     fn note_path_signature_is_stable() {
         let phrase = "test test test test test test test test test test test junk";
         assert_eq!(note_path(3), "m/8141'/1'/3'");
-        let pool = address!("0xac01c30f28b32dd31d3c2854012e673e74f6b100");
+        let pool = address!("0xcb83980f3cc99e258295814375b0a94fe0ac0e86");
         let one = Ruint::try_from(1u64).unwrap();
         let a = note_at(phrase, 0, one, 8141, pool).unwrap();
         let b = note_at(phrase, 0, one, 8141, pool).unwrap();

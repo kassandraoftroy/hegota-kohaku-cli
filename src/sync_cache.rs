@@ -476,7 +476,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pool-sync-devnet.bin");
-        let pool = address!("0xac01c30f28b32dd31d3c2854012e673e74f6b100");
+        let pool = address!("0xcb83980f3cc99e258295814375b0a94fe0ac0e86");
         let mut cache = SyncCache::open_limited(&path, 8141, pool, 100, MAX_CACHE_BYTES).unwrap();
         assert_eq!(cache.through(), 99);
         let leaf = LoggedEvent {
