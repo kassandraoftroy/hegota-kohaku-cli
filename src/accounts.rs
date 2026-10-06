@@ -9,7 +9,10 @@ use alloy::{
     sol,
 };
 use anyhow::{Result, bail};
-use kohaku_minimal_shield::{abis::FrameAccountFactory, frame_account_salt, predict_frame_account};
+use kohaku_minimal_shield::{
+    abis::{FrameAccount, FrameAccountFactory},
+    frame_account_salt, predict_frame_account,
+};
 
 use crate::{
     chain::{self, Network, Token},
@@ -67,21 +70,73 @@ pub async fn predict_account(
     owner: Address,
     creation_code: &[u8],
 ) -> Result<Address> {
-    if creation_code.is_empty() {
-        bail!(
-            "frame_account_creation_code is required to predict smart-account addresses offline"
-        );
-    }
-    let local = predict_frame_account(factory, owner, creation_code);
+    predict_account_mode(provider, factory, owner, creation_code, true).await
+}
+
+/// Resolve a FrameAccount address.
+///
+/// * `strict` (transfers / unshield tails): undeployed accounts must have local CREATE2
+///   equal to RPC `getAddress`. Deployed accounts must report `owner()` equal to `owner`.
+/// * non-strict (balances / scan): prefer RPC `getAddress`; verify `owner()` when deployed.
+///   A stale `frame_account_creation_code` pin only warns.
+pub async fn predict_account_mode(
+    provider: &impl Provider,
+    factory: Address,
+    owner: Address,
+    creation_code: &[u8],
+    strict: bool,
+) -> Result<Address> {
     let salt = frame_account_salt(owner);
     let rpc = FrameAccountFactory::new(factory, provider)
         .getAddress(owner, salt)
         .call()
         .await?;
-    if rpc != local {
-        bail!(
-            "FrameAccount address mismatch: local CREATE2 {local:#x} != RPC getAddress {rpc:#x}.              Refuse to use a possibly malicious RPC prediction."
+    let code = provider.get_code_at(rpc).await?;
+    let deployed = !code.is_empty();
+
+    if deployed {
+        let onchain_owner = FrameAccount::new(rpc, provider).owner().call().await?;
+        if onchain_owner != owner {
+            bail!(
+                "FrameAccount {rpc:#x} owner is {onchain_owner:#x}, expected {owner:#x}; refusing RPC address"
+            );
+        }
+        if !creation_code.is_empty() {
+            let local = predict_frame_account(factory, owner, creation_code);
+            if local != rpc {
+                eprintln!(
+                    "warning: frame_account_creation_code is stale \
+                     (local CREATE2 {local:#x} != on-chain {rpc:#x}); using owner-verified account"
+                );
+            }
+        }
+        return Ok(rpc);
+    }
+
+    // Undeployed: offline CREATE2 must agree with the factory before we ever send funds there.
+    if creation_code.is_empty() {
+        if strict {
+            bail!(
+                "frame_account_creation_code is required to predict undeployed smart-account addresses"
+            );
+        }
+        return Ok(rpc);
+    }
+    let local = predict_frame_account(factory, owner, creation_code);
+    if local != rpc {
+        if strict {
+            bail!(
+                "FrameAccount CREATE2 pin mismatch: local {local:#x} != RPC getAddress {rpc:#x}.\n\
+                 Update `frame_account_creation_code` in the network profile (or set \
+                 HEGOTA_FRAME_ACCOUNT_CREATION_CODE) to the creation bytecode baked into the \
+                 factory. Refusing to use an undeployed RPC prediction alone."
+            );
+        }
+        eprintln!(
+            "warning: frame_account_creation_code is stale \
+             (local CREATE2 {local:#x} != RPC {rpc:#x}); using RPC address for scan only"
         );
+        return Ok(rpc);
     }
     Ok(local)
 }
@@ -187,7 +242,14 @@ pub async fn load_smart(
         let (smart, held, rpcs, stop) =
             chain::with_isolated_provider(url.clone(), without_tor, |provider| async move {
                 let owner = signer_at(&mnemonic, &smart_owner_path(j))?;
-                let account = predict_account(&provider, factory, owner.address(), &creation_code).await?;
+                let account = predict_account_mode(
+                    &provider,
+                    factory,
+                    owner.address(),
+                    &creation_code,
+                    false,
+                )
+                .await?;
                 let mut rpcs = 1u64;
                 let code = provider.get_code_at(account).await?;
                 rpcs += 1;
@@ -246,7 +308,14 @@ pub async fn next_free_smart(
         let creation_code = creation_code.clone();
         let smart = chain::with_isolated_provider(url.clone(), without_tor, |provider| async move {
             let owner = signer_at(&mnemonic, &smart_owner_path(j))?;
-            let account = predict_account(&provider, factory, owner.address(), &creation_code).await?;
+            let account = predict_account_mode(
+                &provider,
+                factory,
+                owner.address(),
+                &creation_code,
+                false,
+            )
+            .await?;
             let code = provider.get_code_at(account).await?;
             if !code.is_empty() {
                 return Ok(None);
@@ -281,7 +350,14 @@ pub async fn load_one_smart(
     let mnemonic = secrets.mnemonic.clone();
     chain::with_isolated_provider(url, without_tor, |provider| async move {
         let owner = signer_at(&mnemonic, &smart_owner_path(j))?;
-        let account = predict_account(&provider, factory, owner.address(), &creation_code).await?;
+        let account = predict_account_mode(
+            &provider,
+            factory,
+            owner.address(),
+            &creation_code,
+            false,
+        )
+        .await?;
         let code = provider.get_code_at(account).await?;
         let balance = provider.get_balance(account).await?;
         Ok(Smart {
@@ -450,7 +526,14 @@ pub async fn scan_imported(
                 async move {
                     chain::with_isolated_provider(url, without_tor, |provider| async move {
                         let owner = signer_at(&mnemonic, &smart_owner_path(index))?;
-                        let account = predict_account(&provider, factory, owner.address(), &creation_code).await?;
+                        let account = predict_account_mode(
+                            &provider,
+                            factory,
+                            owner.address(),
+                            &creation_code,
+                            false,
+                        )
+                        .await?;
                         address_was_used(&provider, account).await
                     })
                     .await
