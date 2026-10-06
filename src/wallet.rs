@@ -1,17 +1,20 @@
 //! Encrypted mnemonic wallet. Notes live here because the chain only stores commitments.
 
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
 use alloy::{
-    primitives::{Address, B256, keccak256},
+    primitives::{Address, keccak256},
     signers::{
         SignerSync,
         local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English},
     },
+    sol,
+    sol_types::{SolStruct, eip712_domain},
 };
 use anyhow::{Context, Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -26,6 +29,13 @@ use ruint::aliases::U256 as Ruint;
 use serde::{Deserialize, Serialize};
 
 const WALLET_FILE: &str = "wallet.json";
+
+sol! {
+    #[derive(Debug)]
+    struct HegotaNote {
+        uint64 noteIndex;
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedNote {
@@ -173,7 +183,25 @@ pub fn save(root: &Path, name: &str, password: &str, secrets: &Secrets) -> Resul
         nonce: hex::encode(nonce),
         ciphertext: hex::encode(ct),
     };
-    fs::write(dir.join(WALLET_FILE), serde_json::to_vec_pretty(&env)?)?;
+    let bytes = serde_json::to_vec_pretty(&env)?;
+    let path = dir.join(WALLET_FILE);
+    let tmp = dir.join(format!(".{WALLET_FILE}.tmp"));
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("{}", tmp.display()))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&tmp, &path).with_context(|| format!("{}", path.display()))?;
+    // Best-effort directory fsync so the rename itself is durable.
+    if let Ok(dir_file) = File::open(&dir) {
+        let _ = dir_file.sync_all();
+    }
     Ok(())
 }
 
@@ -212,29 +240,24 @@ pub fn smart_owner_path(index: u32) -> String {
     format!("m/44'/60'/0'/8141'/{index}'")
 }
 
-/// One hardened index per private note. The key signs a fixed message; it is not the note itself.
+/// One hardened index per private note. The key signs EIP-712 typed data; it is not the note itself.
 pub fn note_path(index: u32) -> String {
     format!("m/8141'/1'/{index}'")
 }
 
-const NOTE_MESSAGE: &[u8] = b"kohaku-hegota private note v1";
-
-/// Domain byte prepended to the note message, same shape as EIP-7702's `0x05`.
-/// Not `0x05`, and not the EIP-191 personal-sign prefix, so a hardware wallet can
-/// tell this signature apart from a normal message and allow or refuse it.
-const NOTE_MAGIC: u8 = 0x4b;
-
-fn note_digest() -> B256 {
-    let mut preimage = Vec::with_capacity(1 + NOTE_MESSAGE.len());
-    preimage.push(NOTE_MAGIC);
-    preimage.extend_from_slice(NOTE_MESSAGE);
-    keccak256(preimage)
+fn note_domain(chain_id: u64, pool: Address) -> alloy::dyn_abi::Eip712Domain {
+    eip712_domain! {
+        name: "Kohaku Hegota Note",
+        version: "1",
+        chain_id: chain_id,
+        verifying_contract: pool,
+    }
 }
 
-/// `spend_key` and `rho` from a raw secp256k1 signature by `m/8141'/1'/j'`.
+/// `spend_key` and `rho` from an EIP-712 signature by `m/8141'/1'/j'`.
 ///
-/// The signed hash is `keccak256(NOTE_MAGIC || message)`. RFC 6979 makes that
-/// deterministic. A hardware wallet reproduces it by signing that hash, not by `personal_sign`.
+/// Domain binds notes to the pool (`verifying_contract`) and chain. RFC 6979 makes
+/// the signature deterministic for a given index.
 pub fn note_at(
     mnemonic: &str,
     index: u32,
@@ -243,8 +266,13 @@ pub fn note_at(
     pool: Address,
 ) -> Result<Note> {
     let signer = signer_at(mnemonic, &note_path(index))?;
+    let payload = HegotaNote {
+        noteIndex: u64::from(index),
+    };
+    let domain = note_domain(chain_id, pool);
+    let digest = payload.eip712_signing_hash(&domain);
     let sig = signer
-        .sign_hash_sync(&note_digest())
+        .sign_hash_sync(&digest)
         .map_err(|e| anyhow::anyhow!("note signature: {e}"))?;
     let bytes = sig.as_bytes();
     Ok(Note {
@@ -288,12 +316,13 @@ fn decode_hex(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NOTE_MAGIC, NOTE_MESSAGE, create_wallet, eoa_path, load, note_at, note_digest, note_path,
-        signer_at, smart_owner_path,
+        HegotaNote, create_wallet, eoa_path, load, note_at, note_domain, note_path, signer_at,
+        smart_owner_path,
     };
     use alloy::{
-        primitives::{address, keccak256},
+        primitives::address,
         signers::SignerSync,
+        sol_types::SolStruct,
     };
     use kohaku_minimal_shield::crypto::P;
     use ruint::aliases::U256 as Ruint;
@@ -323,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn note_path_signature_is_stable() {
+    fn note_path_eip712_signature_is_stable() {
         let phrase = "test test test test test test test test test test test junk";
         assert_eq!(note_path(3), "m/8141'/1'/3'");
         let pool = address!("0xcb83980f3cc99e258295814375b0a94fe0ac0e86");
@@ -337,14 +366,16 @@ mod tests {
         assert_ne!(a.spend_key, other.spend_key);
         assert!(a.spend_key < P && a.rho < P);
 
+        let other_pool = address!("0x0000000000000000000000000000000000000001");
+        let different_pool = note_at(phrase, 0, one, 8141, other_pool).unwrap();
+        assert_ne!(a.spend_key, different_pool.spend_key);
+
         let signer = signer_at(phrase, &note_path(0)).unwrap();
-        let personal = signer.sign_message_sync(NOTE_MESSAGE).unwrap();
-        let prefixed = signer.sign_hash_sync(&note_digest()).unwrap();
-        assert_ne!(personal.as_bytes(), prefixed.as_bytes());
-        assert_eq!(note_digest(), {
-            let mut preimage = vec![NOTE_MAGIC];
-            preimage.extend_from_slice(NOTE_MESSAGE);
-            keccak256(preimage)
-        });
+        let payload = HegotaNote { noteIndex: 0 };
+        let domain = note_domain(8141, pool);
+        let typed = signer.sign_typed_data_sync(&payload, &domain).unwrap();
+        let personal = signer.sign_message_sync(b"kohaku-hegota private note v1").unwrap();
+        assert_ne!(typed.as_bytes(), personal.as_bytes());
+        let _ = payload.eip712_signing_hash(&domain);
     }
 }

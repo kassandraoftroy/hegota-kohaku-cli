@@ -134,6 +134,13 @@ enum Command {
         #[arg(long)]
         tail_calls: Option<String>,
     },
+    /// Claim pool withdrawal credit for an account.
+    Claim {
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Rescan mnemonic note indexes against pool commitments.
+    Rescan,
 }
 
 #[tokio::main]
@@ -252,6 +259,14 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Claim { from } => {
+            let mut app = app;
+            flow::claim(&mut app, from).await
+        }
+        Command::Rescan => {
+            let mut app = app;
+            flow::rescan_notes(&mut app).await
+        }
         Command::CreateWallet { .. } | Command::ListWallets | Command::HydrateLocalCache => {
             unreachable!()
         }
@@ -316,7 +331,9 @@ async fn create(
         found.as_ref().map(|(accounts, _)| accounts.clone()),
     )?;
     if cli.non_interactive {
-        let mut body = serde_json::json!({ "wallet": name, "mnemonic": phrase });
+        let _ = phrase; // kept only for interactive reveal
+        // Never print the mnemonic in machine-readable output.
+        let mut body = serde_json::json!({ "wallet": name });
         if let Some((accounts, smart_scanned)) = &found {
             body["publicIndexes"] = serde_json::json!(accounts.public_indexes);
             body["nextPublic"] = serde_json::json!(accounts.next_public);
@@ -344,6 +361,31 @@ async fn create(
         println!("wallet {name} created. Write this phrase down; it is not shown again.");
         crate::ui::print_box(&phrase);
     }
+
+    if imported.is_some() {
+        // Best-effort note recovery against the pool.
+        if let Ok(rpc) = chain::rpc_url(cli.rpc_url.clone()) {
+            if let Ok(net) = load_network(&cli.network) {
+                if let Ok(secrets) = wallet::load(&root, name, &password) {
+                    let mut app = App {
+                        non_interactive: cli.non_interactive,
+                        broadcast_flag: false,
+                        rpc,
+                        without_tor: chain::without_tor(cli.without_tor),
+                        net,
+                        root: root.clone(),
+                        name: name.to_string(),
+                        password: password.clone(),
+                        secrets,
+                    };
+                    if let Err(err) = flow::rescan_notes(&mut app).await {
+                        eprintln!("note rescan skipped: {err}");
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

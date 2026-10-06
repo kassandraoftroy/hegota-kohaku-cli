@@ -21,6 +21,8 @@ const MAGIC: &[u8; 4] = b"KHPC";
 const VERSION: u8 = 1;
 const HEADER_LEN: u64 = 64;
 pub const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Blocks near head are never trusted from cache alone.
+pub const REORG_MARGIN: u64 = 32;
 
 pub fn cache_path(root: &Path, network: &str) -> PathBuf {
     root.join(format!("pool-sync-{network}.bin"))
@@ -39,8 +41,26 @@ pub fn install_download(
 ) -> Result<()> {
     let tmp = path.with_extension("bin.part");
     fs::write(&tmp, bytes).with_context(|| format!("{}", tmp.display()))?;
-    match SyncCache::open(&tmp, chain_id, pool, deployed_block) {
-        Ok(cache) => drop(cache),
+    match SyncCache::open(&tmp, chain_id, pool, deployed_block).and_then(|mut cache| {
+        // Fully decode every record and confirm the header length matches the payload.
+        let records = cache.read_records()?;
+        let encoded: usize = records.iter().map(|e| encode(e).len()).sum();
+        if encoded as u64 != cache.header.records_len {
+            bail!(
+                "sync cache records_len {} does not match decoded size {encoded}",
+                cache.header.records_len
+            );
+        }
+        let file_len = cache.file.metadata()?.len();
+        let expected = HEADER_LEN + cache.header.records_len;
+        if file_len != expected {
+            bail!(
+                "sync cache file size {file_len} does not match header end {expected}"
+            );
+        }
+        Ok(())
+    }) {
+        Ok(()) => {}
         Err(err) => {
             let _ = fs::remove_file(&tmp);
             return Err(err);
@@ -114,9 +134,21 @@ impl SyncCache {
                 );
             }
             let end = HEADER_LEN + header.records_len;
-            if file.metadata()?.len() > end {
+            let len = file.metadata()?.len();
+            if len < end {
+                bail!(
+                    "sync cache {} truncated: file {len} bytes, header expects {end}",
+                    path.display()
+                );
+            }
+            if len > end {
                 file.set_len(end)?;
             }
+            // Decode every record so a corrupt payload fails at open.
+            file.seek(SeekFrom::Start(HEADER_LEN))?;
+            let mut buf = vec![0u8; header.records_len as usize];
+            file.read_exact(&mut buf)?;
+            let _ = decode_records(&buf)?;
             header
         };
         Ok(Self {
@@ -288,21 +320,31 @@ impl<P: Provider + Clone> SyncerBackend for CachingSyncer<P> {
     ) -> Result<Vec<SyncEvent>, SyncerError> {
         let mut cache = SyncCache::open(&self.path, self.chain_id, self.pool, self.deployed_block)
             .map_err(cache_err)?;
-        let through = cache.through();
+        // Never trust the reorg window from cache. Cache only through latest-REORG_MARGIN;
+        // always re-fetch the last REORG_MARGIN blocks from RPC.
+        let safe_through = to_block.saturating_sub(REORG_MARGIN);
+        let cached_through = cache.through().min(safe_through);
         let mut events = Vec::new();
-        if through >= from_block {
+        if cached_through >= from_block {
             events.extend(
                 cache
-                    .events_through(from_block, through.min(to_block))
+                    .events_through(from_block, cached_through.min(to_block))
                     .map_err(cache_err)?,
             );
         }
-        let rpc_from = from_block.max(through.saturating_add(1));
-        if rpc_from <= to_block && through < to_block {
+        let rpc_from = from_block.max(cached_through.saturating_add(1));
+        if rpc_from <= to_block {
             let fetched = self.inner.fetch(pool, rpc_from, to_block).await?;
-            if rpc_from == cache.next_block() {
+            // Persist only the safe prefix so a reorg cannot freeze a bad tip forever.
+            let persist_to = safe_through;
+            if persist_to >= rpc_from && rpc_from == cache.next_block() {
+                let durable: Vec<_> = fetched
+                    .iter()
+                    .filter(|e| e.block <= persist_to)
+                    .cloned()
+                    .collect();
                 cache
-                    .extend(rpc_from, to_block, &fetched)
+                    .extend(rpc_from, persist_to, &durable)
                     .map_err(cache_err)?;
             }
             events.extend(fetched.into_iter().map(|logged| logged.event));

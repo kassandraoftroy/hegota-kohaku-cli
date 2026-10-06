@@ -9,7 +9,7 @@ use alloy::{
     sol,
 };
 use anyhow::{Result, bail};
-use kohaku_minimal_shield::{abis::FrameAccountFactory, frame_account_salt};
+use kohaku_minimal_shield::{abis::FrameAccountFactory, frame_account_salt, predict_frame_account};
 
 use crate::{
     chain::{self, Network, Token},
@@ -65,13 +65,25 @@ pub async fn predict_account(
     provider: &impl Provider,
     factory: Address,
     owner: Address,
+    creation_code: &[u8],
 ) -> Result<Address> {
+    if creation_code.is_empty() {
+        bail!(
+            "frame_account_creation_code is required to predict smart-account addresses offline"
+        );
+    }
+    let local = predict_frame_account(factory, owner, creation_code);
     let salt = frame_account_salt(owner);
-    let addr = FrameAccountFactory::new(factory, provider)
+    let rpc = FrameAccountFactory::new(factory, provider)
         .getAddress(owner, salt)
         .call()
         .await?;
-    Ok(addr)
+    if rpc != local {
+        bail!(
+            "FrameAccount address mismatch: local CREATE2 {local:#x} != RPC getAddress {rpc:#x}.              Refuse to use a possibly malicious RPC prediction."
+        );
+    }
+    Ok(local)
 }
 
 async fn fetch_tokens(
@@ -162,6 +174,7 @@ pub async fn load_smart(
     let mut j = 0u32;
     let limit = seen.iter().copied().max().unwrap_or(0).saturating_add(8);
     let factory = net.acct_factory;
+    let creation_code = crate::chain::require_creation_code(net)?.to_vec();
     let mnemonic = secrets.mnemonic.clone();
     loop {
         if j > limit && !seen.contains(&j) {
@@ -170,10 +183,11 @@ pub async fn load_smart(
         let seen = seen.clone();
         let mnemonic = mnemonic.clone();
         let tokens = tokens.to_vec();
+        let creation_code = creation_code.clone();
         let (smart, held, rpcs, stop) =
             chain::with_isolated_provider(url.clone(), without_tor, |provider| async move {
                 let owner = signer_at(&mnemonic, &smart_owner_path(j))?;
-                let account = predict_account(&provider, factory, owner.address()).await?;
+                let account = predict_account(&provider, factory, owner.address(), &creation_code).await?;
                 let mut rpcs = 1u64;
                 let code = provider.get_code_at(account).await?;
                 rpcs += 1;
@@ -225,12 +239,14 @@ pub async fn next_free_smart(
     secrets: &Secrets,
 ) -> Result<Smart> {
     let factory = crate::chain::require_factory(net)?;
+    let creation_code = crate::chain::require_creation_code(net)?.to_vec();
     let mnemonic = secrets.mnemonic.clone();
     for j in 0..10_000u32 {
         let mnemonic = mnemonic.clone();
+        let creation_code = creation_code.clone();
         let smart = chain::with_isolated_provider(url.clone(), without_tor, |provider| async move {
             let owner = signer_at(&mnemonic, &smart_owner_path(j))?;
-            let account = predict_account(&provider, factory, owner.address()).await?;
+            let account = predict_account(&provider, factory, owner.address(), &creation_code).await?;
             let code = provider.get_code_at(account).await?;
             if !code.is_empty() {
                 return Ok(None);
@@ -261,10 +277,11 @@ pub async fn load_one_smart(
     j: u32,
 ) -> Result<Smart> {
     let factory = crate::chain::require_factory(net)?;
+    let creation_code = crate::chain::require_creation_code(net)?.to_vec();
     let mnemonic = secrets.mnemonic.clone();
     chain::with_isolated_provider(url, without_tor, |provider| async move {
         let owner = signer_at(&mnemonic, &smart_owner_path(j))?;
-        let account = predict_account(&provider, factory, owner.address()).await?;
+        let account = predict_account(&provider, factory, owner.address(), &creation_code).await?;
         let code = provider.get_code_at(account).await?;
         let balance = provider.get_balance(account).await?;
         Ok(Smart {
@@ -422,16 +439,18 @@ pub async fn scan_imported(
     let smart_scanned = smart_later;
     let smart = if smart_scanned {
         let factory = net.acct_factory;
+        let creation_code = crate::chain::require_creation_code(net)?.to_vec();
         let mnemonic_owned = mnemonic.to_string();
         let url = url.clone();
         scan_index_batches(
             |index| {
                 let url = url.clone();
                 let mnemonic = mnemonic_owned.clone();
+                let creation_code = creation_code.clone();
                 async move {
                     chain::with_isolated_provider(url, without_tor, |provider| async move {
                         let owner = signer_at(&mnemonic, &smart_owner_path(index))?;
-                        let account = predict_account(&provider, factory, owner.address()).await?;
+                        let account = predict_account(&provider, factory, owner.address(), &creation_code).await?;
                         address_was_used(&provider, account).await
                     })
                     .await
