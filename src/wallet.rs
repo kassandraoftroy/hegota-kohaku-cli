@@ -254,17 +254,23 @@ fn note_domain(chain_id: u64, pool: Address) -> alloy::dyn_abi::Eip712Domain {
     }
 }
 
+/// `spend_key` and `rho` for `m/8141'/1'/j'`. The value is not part of the signature.
+#[derive(Debug, Clone, Copy)]
+pub struct NoteSecrets {
+    pub spend_key: Ruint,
+    pub rho: Ruint,
+}
+
 /// `spend_key` and `rho` from an EIP-712 signature by `m/8141'/1'/j'`.
 ///
 /// Domain binds notes to the pool (`verifying_contract`) and chain. RFC 6979 makes
 /// the signature deterministic for a given index.
-pub fn note_at(
+pub fn note_secrets(
     mnemonic: &str,
     index: u32,
-    value: Ruint,
     chain_id: u64,
     pool: Address,
-) -> Result<Note> {
+) -> Result<NoteSecrets> {
     let signer = signer_at(mnemonic, &note_path(index))?;
     let payload = HegotaNote {
         noteIndex: u64::from(index),
@@ -275,13 +281,35 @@ pub fn note_at(
         .sign_hash_sync(&digest)
         .map_err(|e| anyhow::anyhow!("note signature: {e}"))?;
     let bytes = sig.as_bytes();
-    Ok(Note {
+    Ok(NoteSecrets {
         spend_key: field_from_sig(&bytes, 0),
         rho: field_from_sig(&bytes, 1),
+    })
+}
+
+pub fn note_from_secrets(secrets: NoteSecrets, value: Ruint, chain_id: u64, pool: Address) -> Note {
+    Note {
+        spend_key: secrets.spend_key,
+        rho: secrets.rho,
         value,
         chain_id,
         pool,
-    })
+    }
+}
+
+pub fn note_at(
+    mnemonic: &str,
+    index: u32,
+    value: Ruint,
+    chain_id: u64,
+    pool: Address,
+) -> Result<Note> {
+    Ok(note_from_secrets(
+        note_secrets(mnemonic, index, chain_id, pool)?,
+        value,
+        chain_id,
+        pool,
+    ))
 }
 
 fn field_from_sig(sig: &[u8; 65], domain: u8) -> Ruint {

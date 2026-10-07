@@ -4,6 +4,7 @@ mod accounts;
 mod chain;
 mod doctor;
 mod flow;
+mod notescan;
 mod sync_cache;
 mod txbuild;
 mod ui;
@@ -140,7 +141,7 @@ enum Command {
         #[arg(long)]
         from: Option<String>,
     },
-    /// Rescan mnemonic note indexes against pool commitments.
+    /// Recover shielded and change notes, including notes past a spent index.
     Rescan,
     /// Offline network-profile check (CREATE2 pin, fee cap, Tor mode). No wallet required.
     Doctor,
