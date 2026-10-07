@@ -876,153 +876,133 @@ pub async fn claim(app: &mut App, account: Option<String>) -> Result<()> {
     .await
 }
 
-/// Recover private notes by re-deriving `note_at` indexes and matching shield inners / commitments.
+/// Recover private notes from shield frames and settle change outputs.
+///
+/// A spent derivation index still advances `next_note`, and the scan continues
+/// so a later change note is not dropped because the first deposit was spent.
 pub async fn rescan_notes(app: &mut App) -> Result<()> {
     let provider = app.provider().await?;
     sync_notes(app, &provider).await?;
-    let msp = provider_for(app).await?;
     let chain = app.net.chain_id;
     let pool = app.net.pool;
-    let path = sync_cache::cache_path(&app.root, &app.net.name);
-    let mut cms = std::collections::HashSet::new();
-    if path.exists() {
-        let mut cache =
-            SyncCache::open(&path, app.net.chain_id, app.net.pool, app.net.deployed_block)?;
-        let through = cache.through();
-        for ev in cache.events_through(app.net.deployed_block, through)? {
-            if let kohaku_minimal_shield::indexer::syncer::SyncEvent::LeafAppended { cm, .. } = ev {
-                cms.insert(cm);
-            }
-        }
-    }
-    // Also collect LeafAppended from RPC so a cold cache still works.
-    {
-        use alloy::rpc::types::Filter;
-        use kohaku_minimal_shield::abis::ShieldedPool::LeafAppended;
-        let filter = Filter::new()
-            .address(pool)
-            .event_signature(LeafAppended::SIGNATURE_HASH)
-            .from_block(app.net.deployed_block);
-        for log in provider.get_logs(&filter).await? {
-            if let Ok(ev) = LeafAppended::decode_log(&log.inner) {
-                cms.insert(Ruint::from_be_bytes(ev.data.cm.0));
-            }
-        }
-    }
-    // Shield txs: match note.inner() against shield(bytes32) calldata and value.
-    let mut recovered = Vec::new();
-    let mut found_indexes = std::collections::HashSet::new();
-    {
-        use alloy::rpc::types::Filter;
-        use kohaku_minimal_shield::abis::ShieldedPool::LeafAppended;
-        let filter = Filter::new()
-            .address(pool)
-            .event_signature(LeafAppended::SIGNATURE_HASH)
-            .from_block(app.net.deployed_block);
-        let logs = provider.get_logs(&filter).await?;
-        let shield_sel = &ShieldedPool::shieldCall::SELECTOR;
-        for log in logs {
-            let Some(tx_hash) = log.transaction_hash else {
-                continue;
-            };
-            let Ok(Some(tx)) = provider.get_transaction_by_hash(tx_hash).await else {
-                continue;
-            };
-            let input: &[u8] = tx.input().as_ref();
-            if input.len() < 4 + 32 || input[..4] != *shield_sel {
-                continue;
-            }
-            let mut inner_bytes = [0u8; 32];
-            inner_bytes.copy_from_slice(&input[4..36]);
-            let inner = Ruint::from_be_bytes(inner_bytes);
-            let value = to_r(tx.value());
-            let Ok(ev) = LeafAppended::decode_log(&log.inner) else {
-                continue;
-            };
-            let cm = Ruint::from_be_bytes(ev.data.cm.0);
-            let start = app.secrets.next_note.saturating_sub(8);
-            let end = app.secrets.next_note.saturating_add(64).max(64);
-            let mut gap = 0u32;
-            for index in start..end {
-                let note = wallet::note_at(&app.secrets.mnemonic, index, value, chain, pool)?;
-                if note.inner() == inner && note.commitment() == cm {
-                    if !found_indexes.contains(&index)
-                        && !app.secrets.notes.iter().any(|n| n.index == Some(index))
-                    {
-                        recovered.push(SavedNote {
-                            note,
-                            pending: false,
-                            index: Some(index),
-                        });
-                        found_indexes.insert(index);
-                    }
-                    break;
-                }
-                gap = gap.saturating_add(1);
-                if gap >= 16 && index > app.secrets.next_note {
-                    break;
-                }
-            }
-        }
-    }
-    // Also try matching existing cms against note indexes for known wallet note values
-    // and zero-value placeholders (covers change notes once value is known locally).
-    let candidate_values: Vec<Ruint> = app
-        .secrets
-        .notes
-        .iter()
-        .map(|n| n.note.value)
-        .chain(recovered.iter().map(|n| n.note.value))
-        .chain(std::iter::once(Ruint::ZERO))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let scan_end = app
-        .secrets
-        .next_note
-        .saturating_add(64)
-        .max(found_indexes.iter().copied().max().unwrap_or(0).saturating_add(1));
-    let mut gap = 0u32;
-    for index in 0..scan_end {
-        if found_indexes.contains(&index)
-            || app.secrets.notes.iter().any(|n| n.index == Some(index))
-        {
-            gap = 0;
+    use alloy::rpc::types::Filter;
+    use kohaku_minimal_shield::abis::ShieldedPool::LeafAppended;
+    let filter = Filter::new()
+        .address(pool)
+        .event_signature(LeafAppended::SIGNATURE_HASH)
+        .from_block(app.net.deployed_block);
+    let logs = provider.get_logs(&filter).await?;
+    let mut leaves = std::collections::HashMap::new();
+    let mut txs = std::collections::HashMap::new();
+    for log in logs {
+        if log.removed {
             continue;
         }
-        let mut hit = false;
-        for value in &candidate_values {
-            let note = wallet::note_at(&app.secrets.mnemonic, index, *value, chain, pool)?;
-            let cm = note.commitment();
-            if cms.contains(&cm) {
-                if msp.indexer.tree().leaf_proof(cm).await.is_ok() {
-                    recovered.push(SavedNote {
-                        note,
-                        pending: false,
-                        index: Some(index),
-                    });
-                    found_indexes.insert(index);
-                    hit = true;
-                    break;
+        let Some(hash) = log.transaction_hash else {
+            continue;
+        };
+        let Ok(ev) = LeafAppended::decode_log(&log.inner) else {
+            continue;
+        };
+        let cm = Ruint::from_be_bytes(ev.data.cm.0);
+        leaves.entry(cm).or_insert(crate::notescan::LeafInfo {
+            index: ev.data.index,
+            epoch: ev.data.epoch,
+        });
+        let pos = (
+            log.block_number.unwrap_or(0),
+            log.transaction_index.unwrap_or(0),
+            log.log_index.unwrap_or(0),
+        );
+        txs.entry(hash)
+            .and_modify(|cur: &mut (u64, u64, u64)| {
+                if pos < *cur {
+                    *cur = pos;
                 }
-            }
-        }
-        if hit {
-            gap = 0;
-        } else {
-            gap = gap.saturating_add(1);
-            if gap >= 16 && index >= app.secrets.next_note {
-                break;
+            })
+            .or_insert(pos);
+    }
+    let spent = spent_nullifiers(app, &provider).await?;
+    let chain_epoch = ShieldedPool::new(pool, &provider)
+        .currentEpoch()
+        .call()
+        .await
+        .unwrap_or(0);
+    let max_epoch = leaves
+        .values()
+        .map(|leaf| leaf.epoch)
+        .max()
+        .unwrap_or(0)
+        .max(chain_epoch);
+    let total = txs.len() as u64;
+    let report = block_sync_progress("reading pool transactions", None);
+    let mut shields = Vec::new();
+    let mut settles = Vec::new();
+    for (done, (hash, pos)) in txs.into_iter().enumerate() {
+        report(done as u64, total.max(1));
+        for action in actions_for_tx(&provider, hash).await {
+            match action {
+                crate::notescan::PoolAction::Shield { inner, value } => {
+                    shields.push(crate::notescan::ShieldSeen { inner, value });
+                }
+                crate::notescan::PoolAction::Settle {
+                    nf1,
+                    nf2,
+                    out1,
+                    out2,
+                    public_amount,
+                    fee,
+                    epoch,
+                } => settles.push(crate::notescan::SettleSeen {
+                    nf1,
+                    nf2,
+                    out1,
+                    out2,
+                    public_amount,
+                    fee,
+                    epoch,
+                    block: pos.0,
+                    tx_index: pos.1,
+                    log_index: pos.2,
+                }),
             }
         }
     }
-    let added = recovered.len();
-    if let Some(max_idx) = found_indexes.iter().copied().max() {
-        if app.secrets.next_note <= max_idx {
-            app.secrets.next_note = max_idx.saturating_add(1);
+    report(total.max(1), total.max(1));
+    let found = crate::notescan::recover_notes(
+        &app.secrets.mnemonic,
+        chain,
+        pool,
+        &leaves,
+        &shields,
+        &settles,
+        &spent,
+        max_epoch,
+    )?;
+    let spent_indexes: std::collections::HashSet<u32> =
+        found.iter().filter(|n| n.spent).map(|n| n.index).collect();
+    app.secrets
+        .notes
+        .retain(|n| n.index.is_none_or(|i| !spent_indexes.contains(&i)));
+    if let Some(next) = found.iter().map(|n| n.index.saturating_add(1)).max() {
+        if app.secrets.next_note < next {
+            app.secrets.next_note = next;
         }
     }
-    app.secrets.notes.extend(recovered);
+    let mut added = 0usize;
+    for note in found.into_iter().filter(|n| !n.spent) {
+        if app.secrets.notes.iter().any(|saved| {
+            saved.index == Some(note.index) || saved.note.commitment() == note.note.commitment()
+        }) {
+            continue;
+        }
+        app.secrets.notes.push(SavedNote {
+            note: note.note,
+            pending: false,
+            index: Some(note.index),
+        });
+        added += 1;
+    }
     wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
     if app.non_interactive {
         println!(
@@ -1041,6 +1021,18 @@ pub async fn rescan_notes(app: &mut App) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn actions_for_tx(provider: &impl Provider, hash: B256) -> Vec<crate::notescan::PoolAction> {
+    if let Ok(Some(raw)) = provider.get_raw_transaction_by_hash(hash).await {
+        if raw.first() == Some(&0x06) || raw.first().is_some_and(|b| *b >= 0xc0) {
+            return crate::notescan::actions_from_raw(raw.as_ref(), Ruint::ZERO);
+        }
+    }
+    let Ok(Some(tx)) = provider.get_transaction_by_hash(hash).await else {
+        return Vec::new();
+    };
+    crate::notescan::actions_from_raw(tx.input().as_ref(), to_r(tx.value()))
 }
 
 pub async fn publish_epoch_root(app: &mut App, from: Option<String>) -> Result<()> {
