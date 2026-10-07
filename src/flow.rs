@@ -1,7 +1,6 @@
 //! Command flows. Interactive order matches kohaku-cli: wallet, password, missing args, confirm.
 
 use alloy::{
-    consensus::Transaction as _,
     primitives::{Address, B256, Bytes, U256, utils::parse_units},
     providers::Provider,
     signers::local::PrivateKeySigner,
@@ -1024,15 +1023,40 @@ pub async fn rescan_notes(app: &mut App) -> Result<()> {
 }
 
 async fn actions_for_tx(provider: &impl Provider, hash: B256) -> Vec<crate::notescan::PoolAction> {
-    if let Ok(Some(raw)) = provider.get_raw_transaction_by_hash(hash).await {
-        if raw.first() == Some(&0x06) || raw.first().is_some_and(|b| *b >= 0xc0) {
-            return crate::notescan::actions_from_raw(raw.as_ref(), Ruint::ZERO);
+    // Hegota nodes expose type 0x06 calls in `frames`. `input` is empty, and
+    // `eth_getRawTransactionByHash` is not implemented.
+    if let Ok(tx) = provider
+        .raw_request::<_, Value>("eth_getTransactionByHash".into(), (hash,))
+        .await
+    {
+        if tx.get("frames").and_then(|v| v.as_array()).is_some() {
+            return crate::notescan::actions_from_tx_json(&tx);
+        }
+        if let Some(input) = tx.get("input").and_then(|v| v.as_str()) {
+            let value = tx
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(quantity_to_r)
+                .unwrap_or(Ruint::ZERO);
+            let bytes = hex::decode(input.strip_prefix("0x").unwrap_or(input)).unwrap_or_default();
+            let actions = crate::notescan::actions_from_raw(&bytes, value);
+            if !actions.is_empty() {
+                return actions;
+            }
         }
     }
-    let Ok(Some(tx)) = provider.get_transaction_by_hash(hash).await else {
-        return Vec::new();
-    };
-    crate::notescan::actions_from_raw(tx.input().as_ref(), to_r(tx.value()))
+    if let Ok(Some(raw)) = provider.get_raw_transaction_by_hash(hash).await {
+        return crate::notescan::actions_from_raw(raw.as_ref(), Ruint::ZERO);
+    }
+    Vec::new()
+}
+
+fn quantity_to_r(s: &str) -> Ruint {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.is_empty() {
+        return Ruint::ZERO;
+    }
+    Ruint::from_str_radix(s, 16).unwrap_or(Ruint::ZERO)
 }
 
 pub async fn publish_epoch_root(app: &mut App, from: Option<String>) -> Result<()> {

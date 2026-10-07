@@ -123,6 +123,30 @@ pub fn actions_from_raw(raw: &[u8], tx_value: Ruint) -> Vec<PoolAction> {
     out
 }
 
+/// This devnet returns type `0x06` transactions as JSON `frames`, with an empty `input`
+/// and no `eth_getRawTransactionByHash`.
+pub fn actions_from_tx_json(tx: &serde_json::Value) -> Vec<PoolAction> {
+    let Some(frames) = tx.get("frames").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for frame in frames {
+        let data = frame
+            .get("data")
+            .or_else(|| frame.get("input"))
+            .and_then(|v| v.as_str())
+            .and_then(decode_hex)
+            .unwrap_or_default();
+        let value = frame
+            .get("value")
+            .and_then(|v| v.as_str())
+            .and_then(parse_quantity)
+            .unwrap_or(Ruint::ZERO);
+        walk_calldata(&data, value, &mut out, 0);
+    }
+    out
+}
+
 pub fn recover_notes(
     mnemonic: &str,
     chain_id: u64,
@@ -494,6 +518,22 @@ fn read_long_len(buf: &[u8], i: &mut usize, n: usize) -> Option<usize> {
     Some(x)
 }
 
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    hex::decode(s).ok()
+}
+
+fn parse_quantity(s: &str) -> Option<Ruint> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.is_empty() {
+        return Some(Ruint::ZERO);
+    }
+    Ruint::from_str_radix(s, 16).ok()
+}
+
 fn int_from_be(bytes: &[u8]) -> Option<Ruint> {
     if bytes.len() > 32 {
         return None;
@@ -505,7 +545,10 @@ fn int_from_be(bytes: &[u8]) -> Option<Ruint> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeafInfo, PoolAction, SettleSeen, ShieldSeen, actions_from_raw, recover_notes};
+    use super::{
+        LeafInfo, PoolAction, SettleSeen, ShieldSeen, actions_from_raw, actions_from_tx_json,
+        recover_notes,
+    };
     use crate::{txbuild, wallet};
     use alloy::{
         primitives::{Address, Bytes, U256, address},
@@ -593,6 +636,37 @@ mod tests {
         };
         assert_eq!(*inner, deposit.inner());
         assert_eq!(*value, r(1_000));
+    }
+
+    #[test]
+    fn rpc_json_frames_decode_settle_when_input_is_empty() {
+        let tx = serde_json::json!({
+            "type": "0x6",
+            "input": "0x",
+            "frames": [{
+                "mode": "0x2",
+                "value": "0x0",
+                "data": "0x921fcac7197f08fbc42490f532466379ada1f83be2307ba42a932cd9981e7fb6aa2d5359000000000000000000000000000000000000000000000000000000000004f62f000000000000000000000000000000000000000000000000000000000000000010fd35b358869f1e10483910240fc5488777de42911ffc614553d64b3cbb5845053fc4a2fbd082769a5c26b6e44ff6c597dc351bd31010ed14306a7f700c51a20302711052d4b337b692a3f3897880c1921737b7270a5ebf50481f3c4ef8efc400e9367dff9fbaf2afdfb5285f7a450308f8ebe7abc5ddc17b53001ffe620d7b2fd476622c67c880b3049a76c7337192362834c9d6dfb55c5060bb96c98932bb000000000000000000000000000000000000000000000000033f55c29d710000000000000000000000000000000000000000000000000000000e7a17bd8ef5a80000000000000000000000005c9a93b44ce45a03d29b93026cbafa2e8492a707000000000000000000000000600db63bc366c317ad0592906f2a6c5c75ffa7a7"
+            }]
+        });
+        let mut actions = actions_from_tx_json(&tx);
+        let PoolAction::Settle {
+            public_amount,
+            fee,
+            out1,
+            epoch,
+            ..
+        } = actions.remove(0)
+        else {
+            panic!("expected settle from json frames");
+        };
+        assert_eq!(public_amount, r(234_000_000_000_000_000));
+        assert_eq!(fee, Ruint::from(4_074_892_057_048_488u64));
+        assert_eq!(epoch, 0);
+        assert_eq!(
+            hex::encode(out1.to_be_bytes::<32>()),
+            "00e9367dff9fbaf2afdfb5285f7a450308f8ebe7abc5ddc17b53001ffe620d7b"
+        );
     }
 
     #[test]
@@ -788,5 +862,167 @@ mod tests {
         assert_eq!(live[0].index, 3);
         assert_eq!(live[0].note.value, r(80));
         assert_eq!(found.iter().filter(|n| n.spent).count(), 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn devnet_phrase_recovers_the_unshield_change() {
+        let phrase = std::env::var("DEVNET_MNEMONIC").expect("set DEVNET_MNEMONIC");
+        let rpc = std::env::var("HEGOTA_RPC_URL")
+            .unwrap_or_else(|_| "https://rpc1.privacy.ethrex.xyz".into());
+        let pool_addr = pool();
+        let deposit_value = Ruint::from(1_234_000_000_000_000_000u64);
+        let deposit = wallet::note_at(&phrase, 0, deposit_value, 8141, pool_addr).unwrap();
+        let client = reqwest::Client::builder().build().unwrap();
+        let sig = "0x1c9386c619e61f45f16a19541b370266f8eb6fd22d241ff010e03cc31ea82368";
+        let change_cm = "0x00e9367dff9fbaf2afdfb5285f7a450308f8ebe7abc5ddc17b53001ffe620d7b";
+        let deposit_logs = rpc_call(
+            &client,
+            &rpc,
+            "eth_getLogs",
+            serde_json::json!([{
+                "fromBlock": "0x2302a",
+                "address": format!("{pool_addr:#x}"),
+                "topics": [sig, word(deposit.commitment())]
+            }]),
+        )
+        .await;
+        let change_logs = rpc_call(
+            &client,
+            &rpc,
+            "eth_getLogs",
+            serde_json::json!([{
+                "fromBlock": "0x2302a",
+                "address": format!("{pool_addr:#x}"),
+                "topics": [sig, change_cm]
+            }]),
+        )
+        .await;
+        let deposit_logs = deposit_logs.as_array().expect("deposit logs");
+        let change_logs = change_logs.as_array().expect("change logs");
+        assert_eq!(
+            deposit_logs.len(),
+            1,
+            "index 0 shield of 1.234 ETH is not in the pool"
+        );
+        assert_eq!(
+            change_logs.len(),
+            1,
+            "known change commitment is not in the pool"
+        );
+        let mut leaves = HashMap::new();
+        let mut shields = Vec::new();
+        let mut settles = Vec::new();
+        for log in deposit_logs.iter().chain(change_logs.iter()) {
+            let (cm, index, epoch) = leaf_meta(log);
+            leaves.insert(cm, LeafInfo { index, epoch });
+            let hash = log["transactionHash"].as_str().unwrap();
+            let tx = rpc_call(
+                &client,
+                &rpc,
+                "eth_getTransactionByHash",
+                serde_json::json!([hash]),
+            )
+            .await;
+            let block = as_u64(super::parse_quantity(log["blockNumber"].as_str().unwrap()).unwrap());
+            for action in actions_from_tx_json(&tx) {
+                match action {
+                    PoolAction::Shield { inner, value } => {
+                        shields.push(ShieldSeen { inner, value });
+                    }
+                    PoolAction::Settle {
+                        nf1,
+                        nf2,
+                        out1,
+                        out2,
+                        public_amount,
+                        fee,
+                        epoch,
+                    } => settles.push(SettleSeen {
+                        nf1,
+                        nf2,
+                        out1,
+                        out2,
+                        public_amount,
+                        fee,
+                        epoch,
+                        block,
+                        tx_index: 0,
+                        log_index: as_u64(
+                            super::parse_quantity(log["logIndex"].as_str().unwrap()).unwrap(),
+                        ),
+                    }),
+                }
+            }
+        }
+        assert!(!shields.is_empty(), "shield frame was not decoded");
+        assert!(!settles.is_empty(), "settle frame was not decoded");
+        let found = recover_notes(
+            &phrase,
+            8141,
+            pool_addr,
+            &leaves,
+            &shields,
+            &settles,
+            &HashSet::new(),
+            0,
+        )
+        .unwrap();
+        let live: Vec<_> = found.iter().filter(|n| !n.spent).collect();
+        assert_eq!(
+            live.len(),
+            1,
+            "indexes {:?}",
+            found.iter().map(|n| (n.index, n.spent)).collect::<Vec<_>>()
+        );
+        assert_eq!(live[0].index, 1);
+        assert_eq!(
+            hex::encode(live[0].note.commitment().to_be_bytes::<32>()),
+            change_cm.trim_start_matches("0x")
+        );
+    }
+
+    async fn rpc_call(
+        client: &reqwest::Client,
+        url: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+        let text = client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        parsed.get("result").cloned().unwrap_or(parsed)
+    }
+
+    fn word(v: Ruint) -> String {
+        format!("0x{}", hex::encode(v.to_be_bytes::<32>()))
+    }
+
+    fn as_u64(v: Ruint) -> u64 {
+        let bytes = v.to_be_bytes::<32>();
+        u64::from_be_bytes(bytes[24..32].try_into().unwrap())
+    }
+
+    fn leaf_meta(log: &serde_json::Value) -> (Ruint, u32, u64) {
+        let topics = log["topics"].as_array().unwrap();
+        let cm = super::parse_quantity(topics[1].as_str().unwrap()).unwrap();
+        let epoch = as_u64(super::parse_quantity(topics[2].as_str().unwrap()).unwrap());
+        let data = super::decode_hex(log["data"].as_str().unwrap()).unwrap();
+        let index = u32::from_be_bytes(data[28..32].try_into().unwrap());
+        (cm, index, epoch)
     }
 }
