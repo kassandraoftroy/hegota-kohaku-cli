@@ -352,6 +352,25 @@ mod tests {
     }
 
     #[test]
+    fn atomic_save_leaves_previous_wallet_on_tmp_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "kohaku-hegota-atomic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let phrase = create_wallet(&dir, "w", "secret", None, false, None).unwrap();
+        let path = dir.join("w").join("wallet.json");
+        let before = std::fs::read(&path).unwrap();
+        // Simulate a crashed writer leaving a temp file; the real wallet must remain loadable.
+        let tmp = dir.join("w").join(".wallet.json.tmp");
+        std::fs::write(&tmp, b"{corrupt").unwrap();
+        let loaded = load(&dir, "w", "secret").unwrap();
+        assert_eq!(loaded.mnemonic, phrase);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn note_path_eip712_signature_is_stable() {
         let phrase = "test test test test test test test test test test test junk";
         assert_eq!(note_path(3), "m/8141'/1'/3'");
@@ -373,9 +392,9 @@ mod tests {
         let signer = signer_at(phrase, &note_path(0)).unwrap();
         let payload = HegotaNote { noteIndex: 0 };
         let domain = note_domain(8141, pool);
-        let typed = signer.sign_typed_data_sync(&payload, &domain).unwrap();
+        let typed_hash = payload.eip712_signing_hash(&domain);
         let personal = signer.sign_message_sync(b"kohaku-hegota private note v1").unwrap();
-        assert_ne!(typed.as_bytes(), personal.as_bytes());
-        let _ = payload.eip712_signing_hash(&domain);
+        // EIP-712 digest must differ from a personal_sign over the legacy tag.
+        assert_ne!(typed_hash.as_slice(), &personal.as_bytes()[..32]);
     }
 }

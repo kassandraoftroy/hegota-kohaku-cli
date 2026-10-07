@@ -24,6 +24,20 @@ pub const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Blocks near head are never trusted from cache alone.
 pub const REORG_MARGIN: u64 = 32;
 
+/// Safe cache tip and RPC fetch range for a sync covering `from_block..=to_block`
+/// given a cache that currently reaches `cache_through` (inclusive).
+#[must_use]
+pub fn reorg_safe_window(
+    from_block: u64,
+    to_block: u64,
+    cache_through: u64,
+) -> (u64, u64, u64) {
+    let safe_through = to_block.saturating_sub(REORG_MARGIN);
+    let cached_through = cache_through.min(safe_through);
+    let rpc_from = from_block.max(cached_through.saturating_add(1));
+    (safe_through, cached_through, rpc_from)
+}
+
 pub fn cache_path(root: &Path, network: &str) -> PathBuf {
     root.join(format!("pool-sync-{network}.bin"))
 }
@@ -322,8 +336,8 @@ impl<P: Provider + Clone> SyncerBackend for CachingSyncer<P> {
             .map_err(cache_err)?;
         // Never trust the reorg window from cache. Cache only through latest-REORG_MARGIN;
         // always re-fetch the last REORG_MARGIN blocks from RPC.
-        let safe_through = to_block.saturating_sub(REORG_MARGIN);
-        let cached_through = cache.through().min(safe_through);
+        let (safe_through, cached_through, rpc_from) =
+            reorg_safe_window(from_block, to_block, cache.through());
         let mut events = Vec::new();
         if cached_through >= from_block {
             events.extend(
@@ -332,7 +346,6 @@ impl<P: Provider + Clone> SyncerBackend for CachingSyncer<P> {
                     .map_err(cache_err)?,
             );
         }
-        let rpc_from = from_block.max(cached_through.saturating_add(1));
         if rpc_from <= to_block {
             let fetched = self.inner.fetch(pool, rpc_from, to_block).await?;
             // Persist only the safe prefix so a reorg cannot freeze a bad tip forever.
@@ -507,10 +520,57 @@ fn take_u256(buf: &[u8], i: &mut usize) -> Result<U256> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Extend, MAX_CACHE_BYTES, SyncCache};
+    use super::{
+        Extend, HEADER_LEN, MAGIC, MAX_CACHE_BYTES, REORG_MARGIN, SyncCache, VERSION,
+        install_download, reorg_safe_window,
+    };
     use alloy::primitives::address;
     use kohaku_minimal_shield::indexer::{rpc::LoggedEvent, syncer::SyncEvent};
     use ruint::aliases::U256;
+
+    #[test]
+    fn reorg_window_never_serves_tip_from_cache() {
+        let latest = 1000u64;
+        let (safe, cached, rpc_from) = reorg_safe_window(900, latest, latest);
+        assert_eq!(safe, latest - REORG_MARGIN);
+        assert_eq!(cached, latest - REORG_MARGIN);
+        assert_eq!(rpc_from, latest - REORG_MARGIN + 1);
+        assert!(cached <= latest - REORG_MARGIN);
+    }
+
+    #[test]
+    fn install_download_rejects_bad_records_len() {
+        let dir = std::env::temp_dir().join(format!("kohaku-bad-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pool-sync-devnet.bin");
+        let pool = address!("0xcb83980f3cc99e258295814375b0a94fe0ac0e86");
+        let mut bytes = vec![0u8; HEADER_LEN as usize];
+        bytes[..4].copy_from_slice(MAGIC);
+        bytes[4] = VERSION;
+        bytes[5..13].copy_from_slice(&8141u64.to_le_bytes());
+        bytes[13..33].copy_from_slice(pool.as_slice());
+        bytes[33..41].copy_from_slice(&200u64.to_le_bytes());
+        // Lie about records_len.
+        bytes[41..49].copy_from_slice(&9999u64.to_le_bytes());
+        assert!(install_download(&path, 8141, pool, 100, &bytes).is_err());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_download_rejects_wrong_chain() {
+        let dir = std::env::temp_dir().join(format!("kohaku-bad-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pool-sync-devnet.bin");
+        let pool = address!("0xcb83980f3cc99e258295814375b0a94fe0ac0e86");
+        let cache = SyncCache::open(&path, 9999, pool, 100).unwrap();
+        drop(cache);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(install_download(&path, 8141, pool, 100, &bytes).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn append_reads_back_and_stops_at_the_size_cap() {

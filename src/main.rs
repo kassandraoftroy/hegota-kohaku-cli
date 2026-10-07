@@ -2,6 +2,7 @@
 
 mod accounts;
 mod chain;
+mod doctor;
 mod flow;
 mod sync_cache;
 mod txbuild;
@@ -141,6 +142,8 @@ enum Command {
     },
     /// Rescan mnemonic note indexes against pool commitments.
     Rescan,
+    /// Offline network-profile check (CREATE2 pin, fee cap, Tor mode). No wallet required.
+    Doctor,
 }
 
 #[tokio::main]
@@ -158,6 +161,12 @@ async fn main() -> Result<()> {
     }
     if matches!(cli.cmd, Command::Version) {
         println!("kohaku-hegota {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if matches!(cli.cmd, Command::Doctor) {
+        let net = load_network(&cli.network)?;
+        let body = doctor::run(&net, cli.without_tor)?;
+        println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
     }
     if matches!(cli.cmd, Command::HydrateLocalCache) {
@@ -267,9 +276,10 @@ async fn main() -> Result<()> {
             let mut app = app;
             flow::rescan_notes(&mut app).await
         }
-        Command::CreateWallet { .. } | Command::ListWallets | Command::HydrateLocalCache => {
-            unreachable!()
-        }
+        Command::CreateWallet { .. }
+        | Command::ListWallets
+        | Command::HydrateLocalCache
+        | Command::Doctor => unreachable!(),
     }
 }
 

@@ -343,8 +343,11 @@ pub async fn transfer(
     amount: Option<String>,
     max: bool,
 ) -> Result<()> {
+    let provider = app.provider().await?;
+    chain::ensure_rpc_matches_network(&provider, &app.net).await?;
     let picked = pick_from(app, from.as_deref(), true).await?;
-    let dest = pick_to(app, to, true, false).await?;
+    // Fund destinations require CREATE2 pin agreement for undeployed aN.
+    let dest = pick_to(app, to, true, false, true).await?;
     let client = chain::frame_client(&app.rpc, app.without_tor).await?;
     let (tip, max_fee) = client.fees_capped(chain::max_fee_cap(&app.net)).await?;
     let reserve = call_cost(
@@ -384,6 +387,8 @@ pub async fn transact_raw(
     payloads: Option<String>,
     values: Option<String>,
 ) -> Result<()> {
+    let provider = app.provider().await?;
+    chain::ensure_rpc_matches_network(&provider, &app.net).await?;
     let picked = pick_from(app, from.as_deref(), true).await?;
     let calls = if let (Some(t), Some(p)) = (targets, payloads) {
         parse_raw(&t, &p, values.as_deref())?
@@ -555,13 +560,14 @@ pub async fn unshield(
                 app.without_tor,
                 &app.net,
                 &app.secrets,
+                true,
             )
             .await?
         } else {
             match to.as_deref() {
                 Some(spec) if spec.starts_with('a') => {
                     let j: u32 = spec[1..].parse().context("smart selector")?;
-                    load_one_smart(app, j).await?
+                    load_one_smart(app, j, true).await?
                 }
                 Some(_) => bail!("--tail-calls needs --next or --to aN"),
                 None if app.non_interactive => bail!("--tail-calls needs --next or --to aN"),
@@ -577,7 +583,7 @@ pub async fn unshield(
             remember_public = Some(index);
             signer.address()
         } else {
-            pick_to(app, to, true, true).await?
+            pick_to(app, to, true, true, true).await?
         };
         (dest, None)
     };
@@ -762,13 +768,14 @@ pub async fn unshield(
 }
 
 
-async fn load_one_smart(app: &App, j: u32) -> Result<Smart> {
+async fn load_one_smart(app: &App, j: u32, strict: bool) -> Result<Smart> {
     accounts::load_one_smart(
         app.rpc.clone(),
         app.without_tor,
         &app.net,
         &app.secrets,
         j,
+        strict,
     )
     .await
 }
@@ -1337,6 +1344,7 @@ pub async fn hydrate_local_cache(
     let pool = chain::pool_of(net);
     let path = sync_cache::cache_path(root, &net.name);
     let provider = chain::http_provider(rpc, without_tor).await?;
+    chain::ensure_rpc_matches_network(&provider, net).await?;
     let head = provider.get_block_number().await?;
     let mut cache = SyncCache::open(&path, pool.chain_id, pool.address, pool.deployed_block)?;
     let from = cache.through().saturating_add(1).max(pool.deployed_block);
@@ -1536,11 +1544,12 @@ async fn pick_to(
     to: Option<String>,
     allow_new_eoa: bool,
     deployed_smart_only: bool,
+    strict_smart: bool,
 ) -> Result<Address> {
     if let Some(spec) = to {
         if let Some(rest) = spec.strip_prefix('a') {
             let j: u32 = rest.parse().context("aN")?;
-            let smart = load_one_smart(app, j).await?;
+            let smart = load_one_smart(app, j, strict_smart).await?;
             if deployed_smart_only && !smart.deployed {
                 bail!(
                     "a{j} is not deployed. Plain unshield needs a deployed account. Use --tail-calls to create it."
@@ -1580,6 +1589,7 @@ async fn pick_to(
         Some(entered),
         allow_new_eoa,
         deployed_smart_only,
+        strict_smart,
     ))
     .await
 }
@@ -2099,6 +2109,7 @@ async fn prompt_tail_account(app: &App) -> Result<Smart> {
             app.without_tor,
             &app.net,
             &app.secrets,
+            true,
         )
         .await;
     }
@@ -2107,7 +2118,7 @@ async fn prompt_tail_account(app: &App) -> Result<Smart> {
         .strip_prefix('a')
         .context("use aN, for example a0")?;
     let j: u32 = rest.parse().context("smart selector")?;
-    load_one_smart(app, j).await
+    load_one_smart(app, j, true).await
 }
 
 fn path_name(picked: &Picked) -> &'static str {
@@ -2130,18 +2141,15 @@ fn rejects_atomic_flag(text: &str) -> bool {
     text.contains("atomic") || text.contains("flag")
 }
 
-fn receipt_status_ok(v: &Value) -> bool {
+pub(crate) fn receipt_status_ok(v: &Value) -> bool {
     v.get("status")
         .and_then(|s| s.as_str())
         .is_some_and(|s| s == "0x1" || s == "1")
 }
 
-async fn send_and_wait(client: &FrameTxClient, tx: &FrameTx) -> Result<Value> {
-    client.gate_spend(tx).await?;
-    let hash = client.send_raw(&tx.raw()).await?;
-    println!("sent {hash:#x}");
-    let receipt = client.wait_receipt(hash, 360).await?;
-    if !receipt_status_ok(&receipt) {
+/// Reject receipts that only have `frameReceipts` without every frame succeeding.
+pub(crate) fn receipt_all_ok(receipt: &Value) -> Result<()> {
+    if !receipt_status_ok(receipt) {
         bail!("transaction failed (status != 0x1): {receipt}");
     }
     if let Some(frames) = receipt.get("frameReceipts").and_then(Value::as_array) {
@@ -2153,6 +2161,15 @@ async fn send_and_wait(client: &FrameTxClient, tx: &FrameTx) -> Result<Value> {
     } else {
         bail!("receipt missing frameReceipts: {receipt}");
     }
+    Ok(())
+}
+
+async fn send_and_wait(client: &FrameTxClient, tx: &FrameTx) -> Result<Value> {
+    client.gate_spend(tx).await?;
+    let hash = client.send_raw(&tx.raw()).await?;
+    println!("sent {hash:#x}");
+    let receipt = client.wait_receipt(hash, 360).await?;
+    receipt_all_ok(&receipt)?;
     Ok(receipt)
 }
 
@@ -2221,11 +2238,13 @@ fn fmt_r(v: Ruint) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_rejected, estimate_public_rpc_steps_for, max_withdrawable, rejects_atomic_flag, ru64,
+        atomic_rejected, estimate_public_rpc_steps_for, max_withdrawable, receipt_all_ok,
+        receipt_status_ok, rejects_atomic_flag, ru64,
     };
     use alloy::primitives::Address;
     use kohaku_frametx_kit::SimulateResult;
     use kohaku_minimal_shield::{Note, plan_unshield};
+    use serde_json::json;
 
     fn sim(valid: Option<bool>, violation: Option<&str>) -> SimulateResult {
         SimulateResult {
@@ -2239,6 +2258,26 @@ mod tests {
             frames: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn receipt_rejects_failed_frame_even_when_frame_receipts_present() {
+        let bad = json!({
+            "status": "0x1",
+            "frameReceipts": [
+                { "status": "0x1" },
+                { "status": "0x0" }
+            ]
+        });
+        assert!(receipt_status_ok(&bad));
+        assert!(receipt_all_ok(&bad).is_err());
+        let good = json!({
+            "status": "0x1",
+            "frameReceipts": [{ "status": "0x1" }, { "status": "1" }]
+        });
+        assert!(receipt_all_ok(&good).is_ok());
+        let missing = json!({ "status": "0x1" });
+        assert!(receipt_all_ok(&missing).is_err());
     }
 
     #[test]

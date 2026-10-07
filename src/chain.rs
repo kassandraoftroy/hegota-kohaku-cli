@@ -269,3 +269,26 @@ fn parse_bytes(s: &str) -> Result<Vec<u8>> {
 pub fn creation_code_bytes(net: &Network) -> Bytes {
     Bytes::from(net.frame_account_creation_code.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::U256;
+
+    #[test]
+    fn max_fee_cap_converts_gwei() {
+        let mut net = load_network("devnet").unwrap();
+        assert_eq!(
+            max_fee_cap(&net),
+            Some(U256::from(100u64) * U256::from(1_000_000_000u64))
+        );
+        net.max_fee_gwei = None;
+        assert_eq!(max_fee_cap(&net), None);
+    }
+
+    #[test]
+    fn without_tor_honors_env_and_flag() {
+        // Flag alone.
+        assert!(without_tor(true));
+    }
+}

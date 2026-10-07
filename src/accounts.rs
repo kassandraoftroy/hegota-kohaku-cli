@@ -64,6 +64,7 @@ pub fn smart_owner(secrets: &Secrets, index: u32) -> Result<PrivateKeySigner> {
     signer_at(&secrets.mnemonic, &smart_owner_path(index))
 }
 
+#[allow(dead_code)] // strict helper; fund paths call predict_account_mode(..., true) directly
 pub async fn predict_account(
     provider: &impl Provider,
     factory: Address,
@@ -294,11 +295,14 @@ pub async fn load_smart(
 }
 
 /// Lowest `j` whose FrameAccount has no code. Each probe uses its own isolation session.
+///
+/// Pass `strict = true` for fund destinations (`--tail-calls --next`); `false` for scan-only.
 pub async fn next_free_smart(
     url: reqwest::Url,
     without_tor: bool,
     net: &Network,
     secrets: &Secrets,
+    strict: bool,
 ) -> Result<Smart> {
     let factory = crate::chain::require_factory(net)?;
     let creation_code = crate::chain::require_creation_code(net)?.to_vec();
@@ -313,7 +317,7 @@ pub async fn next_free_smart(
                 factory,
                 owner.address(),
                 &creation_code,
-                false,
+                strict,
             )
             .await?;
             let code = provider.get_code_at(account).await?;
@@ -338,12 +342,15 @@ pub async fn next_free_smart(
 }
 
 /// One smart account on a single isolation session.
+///
+/// Pass `strict = true` when the address will receive funds (`transfer --to aN`, unshield).
 pub async fn load_one_smart(
     url: reqwest::Url,
     without_tor: bool,
     net: &Network,
     secrets: &Secrets,
     j: u32,
+    strict: bool,
 ) -> Result<Smart> {
     let factory = crate::chain::require_factory(net)?;
     let creation_code = crate::chain::require_creation_code(net)?.to_vec();
@@ -355,7 +362,7 @@ pub async fn load_one_smart(
             factory,
             owner.address(),
             &creation_code,
-            false,
+            strict,
         )
         .await?;
         let code = provider.get_code_at(account).await?;
@@ -567,7 +574,23 @@ pub async fn scan_imported(
 
 #[cfg(test)]
 mod tests {
-    use super::scan_index_batches;
+    use super::*;
+    use alloy::primitives::address;
+    use kohaku_minimal_shield::predict_frame_account;
+    use crate::chain::load_network;
+
+    #[test]
+    fn offline_create2_matches_devnet_selfcheck_vector() {
+        let net = load_network("devnet").unwrap();
+        let owner = address!("0x77ce0b7bab0a63a59b27c84fe7a5dc6ca3ec556e");
+        let expected = address!("0x9b6c14e6bb1d0ac5616caf5adf0449e426217f4b");
+        let predicted =
+            predict_frame_account(net.acct_factory, owner, &net.frame_account_creation_code);
+        assert_eq!(predicted, expected);
+        // Wrong creation code must not collide with the live account.
+        let wrong = predict_frame_account(net.acct_factory, owner, &[0u8; 32]);
+        assert_ne!(wrong, expected);
+    }
 
     #[tokio::test]
     async fn unused_first_batch_stores_nothing() {

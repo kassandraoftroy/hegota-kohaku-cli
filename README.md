@@ -44,3 +44,9 @@ Dry-runs are the default in `--non-interactive` mode unless `--broadcast` is set
 - Pending notes kept after broadcast; confirmed on sync; `rescan` / `claim`
 - Fee cap (`max_fee_gwei`), fee shown in confirm, profile chain id for signing
 - Stricter receipts; safer dry-run (no pre-confirm signed txs / silent split-resend)
+
+```bash
+kohaku-hegota doctor   # offline CREATE2 pin, fee cap, and Tor mode
+```
+
+Issue write-up (disposable): [docs/ISSUE_SOLUTIONS.md](docs/ISSUE_SOLUTIONS.md).
