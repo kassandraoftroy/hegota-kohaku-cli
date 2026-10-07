@@ -48,5 +48,3 @@ Dry-runs are the default in `--non-interactive` mode unless `--broadcast` is set
 ```bash
 kohaku-hegota doctor   # offline CREATE2 pin, fee cap, and Tor mode
 ```
-
-Issue write-up (disposable): [docs/ISSUE_SOLUTIONS.md](docs/ISSUE_SOLUTIONS.md).
