@@ -1,10 +1,11 @@
 //! Command flows. Interactive order matches kohaku-cli: wallet, password, missing args, confirm.
 
 use alloy::{
+    consensus::Transaction as _,
     primitives::{Address, B256, Bytes, U256, utils::parse_units},
     providers::Provider,
     signers::local::PrivateKeySigner,
-    sol_types::SolEvent,
+    sol_types::{SolCall, SolEvent},
 };
 use anyhow::{Context, Result, bail};
 use dialoguer::{Confirm, Input, Select};
@@ -118,6 +119,20 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
                 .collect()
         })
         .collect();
+    let pool = ShieldedPool::new(app.net.pool, &provider);
+    let mut credits: Vec<(String, Address, U256)> = Vec::new();
+    for e in &eoas {
+        let credit = pool.withdrawalCredit(e.signer.address()).call().await.unwrap_or(U256::ZERO);
+        if !credit.is_zero() {
+            credits.push((format!("{}", e.index), e.signer.address(), credit));
+        }
+    }
+    for s in &smart {
+        let credit = pool.withdrawalCredit(s.account).call().await.unwrap_or(U256::ZERO);
+        if !credit.is_zero() {
+            credits.push((format!("a{}", s.index), s.account, credit));
+        }
+    }
     let public: U256 = eoas
         .iter()
         .map(|e| e.balance)
@@ -157,6 +172,12 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
                     "index": n.index,
                     "commitment": format!("{:#x}", b256(n.note.commitment())),
                 })).collect::<Vec<_>>(),
+                "withdrawalCredits": credits.iter().map(|(label, addr, wei)| json!({
+                    "account": label,
+                    "address": format!("{addr:#x}"),
+                    "wei": wei.to_string(),
+                    "eth": fmt(*wei),
+                })).collect::<Vec<_>>(),
             })
         );
         return Ok(());
@@ -187,6 +208,18 @@ pub async fn balances(app: &mut App, verbose: bool) -> Result<()> {
         &["Asset", "Amount"],
         &[vec!["ETH".into(), fmt_r(private)]],
     );
+
+    if !credits.is_empty() {
+        crate::ui::print_section("Unclaimed withdrawal credits");
+        let rows: Vec<Vec<String>> = credits
+            .iter()
+            .map(|(label, addr, wei)| {
+                vec![label.clone(), format!("{addr:#x}"), fmt(*wei)]
+            })
+            .collect();
+        crate::ui::print_table(&["Account", "Address", "Amount"], &rows);
+        println!("claim with: kohaku-hegota claim --from <account>");
+    }
 
     if verbose {
         // 3. Address-by-address (ETH labeled).
@@ -310,16 +343,20 @@ pub async fn transfer(
     amount: Option<String>,
     max: bool,
 ) -> Result<()> {
+    let provider = app.provider().await?;
+    chain::ensure_rpc_matches_network(&provider, &app.net).await?;
     let picked = pick_from(app, from.as_deref(), true).await?;
-    let dest = pick_to(app, to, true, false).await?;
-    let client = chain::frame_client(&app.rpc);
-    let (tip, max_fee) = client.fees().await?;
+    // Fund destinations require CREATE2 pin agreement for undeployed aN.
+    let dest = pick_to(app, to, true, false, true).await?;
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
+    let (tip, max_fee) = client.fees_capped(chain::max_fee_cap(&app.net)).await?;
     let reserve = call_cost(
         &client,
         &picked,
         &[OutCall::simple(dest, U256::ZERO)],
         tip,
         max_fee,
+        app.net.chain_id,
     )
     .await?;
     let value = pick_value(app, amount.as_deref(), max, picked.balance, reserve).await?;
@@ -337,6 +374,7 @@ pub async fn transfer(
             "from": picked.label,
             "to": format!("{dest:#x}"),
             "wei": value.to_string(),
+            "eth": fmt(value),
         }),
     )
     .await
@@ -349,6 +387,8 @@ pub async fn transact_raw(
     payloads: Option<String>,
     values: Option<String>,
 ) -> Result<()> {
+    let provider = app.provider().await?;
+    chain::ensure_rpc_matches_network(&provider, &app.net).await?;
     let picked = pick_from(app, from.as_deref(), true).await?;
     let calls = if let (Some(t), Some(p)) = (targets, payloads) {
         parse_raw(&t, &p, values.as_deref())?
@@ -367,8 +407,8 @@ pub async fn transact_raw(
             .interact_text()?;
         parse_raw(&t, &p, if v.is_empty() { None } else { Some(&v) })?
     };
-    let client = chain::frame_client(&app.rpc);
-    let (tip, max_fee) = client.fees().await?;
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
+    let (tip, max_fee) = client.fees_capped(chain::max_fee_cap(&app.net)).await?;
     let value = calls.iter().fold(U256::ZERO, |a, c| a + c.value);
     commit_calls(
         app,
@@ -395,13 +435,11 @@ pub async fn shield(
     max: bool,
 ) -> Result<()> {
     let picked = pick_from(app, from.as_deref(), true).await?;
-    let client = chain::frame_client(&app.rpc);
-    let (tip, max_fee) = client.fees().await?;
-    let chain = client.chain_id().await?;
-    if chain != app.net.chain_id {
-        bail!("rpc chain {chain} != profile {}", app.net.chain_id);
-    }
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
+    let (tip, max_fee) = client.fees_capped(chain::max_fee_cap(&app.net)).await?;
+    let chain = app.net.chain_id;
     let provider = app.provider().await?;
+    chain::ensure_rpc_matches_network(&provider, &app.net).await?;
     let epoch = ShieldedPool::new(app.net.pool, &provider)
         .currentEpoch()
         .call()
@@ -409,6 +447,22 @@ pub async fn shield(
     let shield_cost = shield_cost(app, &picked, epoch, chain, tip, max_fee).await?;
     let value = pick_value(app, amount.as_deref(), max, picked.balance, shield_cost).await?;
     let note_index = app.secrets.next_note;
+    let summary = json!({
+        "kind": "shield",
+        "path": path_name(&picked),
+        "from": format!("{:#x}", picked.address),
+        "wei": value.to_string(),
+        "eth": fmt(value),
+        "maxFeeWei": max_fee.to_string(),
+        "gasReserveWei": shield_cost.to_string(),
+        "gasReserveEth": fmt(shield_cost),
+        "noteIndex": note_index,
+        "publishesRoot": true,
+    });
+    if !want_broadcast(app, &summary)? {
+        return Ok(());
+    }
+    // Sign only after confirmation so dry-run never emits a signed FrameTx.
     let note = wallet::note_at(
         &app.secrets.mnemonic,
         note_index,
@@ -418,18 +472,6 @@ pub async fn shield(
     )?;
     let tx = shield_tx(app, &picked, &note, epoch, chain, tip, max_fee).await?;
     ensure_can_pay(picked.balance, tx.max_cost(), value)?;
-    let summary = json!({
-        "kind": "shield",
-        "path": path_name(&picked),
-        "from": format!("{:#x}", picked.address),
-        "wei": value.to_string(),
-        "noteIndex": note_index,
-        "commitment": format!("{:#x}", b256(note.commitment())),
-        "publishesRoot": true,
-    });
-    if !want_broadcast(app, &summary)? {
-        return Ok(());
-    }
     app.secrets.next_note = note_index.saturating_add(1);
     app.secrets.notes.push(SavedNote {
         note: note.clone(),
@@ -437,22 +479,20 @@ pub async fn shield(
         index: Some(note_index),
     });
     wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
-    let client = chain::frame_client(&app.rpc);
-    if let Err(err) = send_and_wait(&client, &tx).await {
-        if !err.to_string().contains("timed out waiting") {
-            app.secrets.notes.retain(|n| n.note != note);
-            wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
-        }
-        return Err(err);
-    }
-    if let Some(saved) = app.secrets.notes.iter_mut().rev().find(|n| n.note == note) {
-        saved.pending = false;
-    }
-    wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
+    // Keep the pending note after any broadcast attempt (including non-timeout errors).
+    send_and_wait(&client, &tx).await?;
     if app.non_interactive {
-        println!("{summary}");
+        println!("{}", json!({
+            "kind": "shield",
+            "wei": value.to_string(),
+            "eth": fmt(value),
+            "noteIndex": note_index,
+            "commitment": format!("{:#x}", b256(note.commitment())),
+            "pending": true,
+        }));
     } else {
-        println!("shielded {}", fmt(value));
+        println!("shielded {} (pending until sync sees the commitment)", fmt(value));
     }
     Ok(())
 }
@@ -478,8 +518,8 @@ pub async fn unshield(
     if total.is_zero() {
         bail!("no unspent private ETH");
     }
-    let client = chain::frame_client(&app.rpc);
-    let (tip, max_fee) = client.fees().await?;
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
+    let (tip, max_fee) = client.fees_capped(chain::max_fee_cap(&app.net)).await?;
     let fee_guess = to_r(max_fee * U256::from(8_000_000u64) * U256::from(2u64));
     let want = if max {
         max_withdrawable(&notes, fee_guess)?
@@ -520,13 +560,14 @@ pub async fn unshield(
                 app.without_tor,
                 &app.net,
                 &app.secrets,
+                true,
             )
             .await?
         } else {
             match to.as_deref() {
                 Some(spec) if spec.starts_with('a') => {
                     let j: u32 = spec[1..].parse().context("smart selector")?;
-                    load_one_smart(app, j).await?
+                    load_one_smart(app, j, true).await?
                 }
                 Some(_) => bail!("--tail-calls needs --next or --to aN"),
                 None if app.non_interactive => bail!("--tail-calls needs --next or --to aN"),
@@ -542,7 +583,7 @@ pub async fn unshield(
             remember_public = Some(index);
             signer.address()
         } else {
-            pick_to(app, to, true, true).await?
+            pick_to(app, to, true, true, true).await?
         };
         (dest, None)
     };
@@ -551,9 +592,16 @@ pub async fn unshield(
         .call()
         .await?;
     let mut slot = published_slot(app, &provider, epoch).await?;
+    let net_arrival = want.saturating_sub(fee_guess.min(want));
     let summary = json!({
         "kind": "unshield",
         "publicWei": want.to_string(),
+        "publicEth": fmt_r(want),
+        "feeWeiGuess": fee_guess.to_string(),
+        "feeEthGuess": fmt_r(fee_guess),
+        "netWeiGuess": net_arrival.to_string(),
+        "netEthGuess": fmt_r(net_arrival),
+        "maxFeePerGasWei": max_fee.to_string(),
         "recipient": format!("{recipient:#x}"),
         "account": smart_for_tail.as_ref().map(|s| format!("a{}", s.index)),
         "merges": plan.merges.iter().map(|m| json!({
@@ -564,13 +612,34 @@ pub async fn unshield(
         "changeWei": plan.change.as_ref().map(|n| n.value.to_string()),
         "noteIndex": app.secrets.next_note,
         "rootSlot": slot,
-        "tail": tail_calls.is_some(),
+        "tail": tail_calls.as_ref().map(|c| c.iter().map(|call| json!({
+            "target": format!("{:#x}", call.target),
+            "value": call.value.to_string(),
+            "data": format!("0x{}", hex::encode(&call.data)),
+        })).collect::<Vec<_>>()),
         "publishesRoot": !plan.merges.is_empty() || plan.change.is_some(),
     });
     if !want_broadcast(app, &summary)? {
         return Ok(());
     }
-    let chain = client.chain_id().await?;
+    // Persist --next allocation before any broadcast so a failed send cannot reuse it.
+    if let Some(index) = remember_smart {
+        if !app.secrets.smart_indexes.contains(&index) {
+            app.secrets.smart_indexes.push(index);
+        }
+        wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
+    }
+    if let Some(index) = remember_public {
+        if !app.secrets.public_indexes.contains(&index) {
+            app.secrets.public_indexes.push(index);
+        }
+        if app.secrets.next_public <= index {
+            app.secrets.next_public = index + 1;
+        }
+        wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
+    }
+    let chain = app.net.chain_id;
+    let creation_code = chain::require_creation_code(&app.net)?.to_vec();
     let mut live: Vec<Note> = notes;
     let mut rng = rand::rng();
     loop {
@@ -600,13 +669,8 @@ pub async fn unshield(
             if let Some(out) = result.change.clone() {
                 remember_born(app, &out, born)?;
             }
-            if let Err(err) = send_and_wait(&client, &result.tx).await {
-                if !err.to_string().contains("timed out waiting") {
-                    app.secrets.notes.retain(|n| n.index != Some(born));
-                    wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
-                }
-                return Err(err);
-            }
+            // Keep pending change notes after any broadcast attempt.
+            send_and_wait(&client, &result.tx).await?;
             live.retain(|n| n != &merge.inputs[0] && n != &merge.inputs[1]);
             let mut born_notes = Vec::new();
             if let Some(out) = result.change.clone() {
@@ -631,6 +695,7 @@ pub async fn unshield(
                     0,
                     chain,
                     true,
+                    &creation_code,
                 )
                 .await?;
             Some(tail)
@@ -669,13 +734,7 @@ pub async fn unshield(
         if let (Some(change), Some(index)) = (result.change.as_ref(), born) {
             remember_born(app, change, index)?;
         }
-        if let Err(err) = send_and_wait(&client, &result.tx).await {
-            if !err.to_string().contains("timed out waiting") && born.is_some() {
-                app.secrets.notes.retain(|n| n.index != born);
-                wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
-            }
-            return Err(err);
-        }
+        send_and_wait(&client, &result.tx).await?;
         live.retain(|n| !step.inputs.iter().any(|spent| spent == n));
         let mut born_notes = Vec::new();
         if let Some(change) = result.change {
@@ -685,34 +744,22 @@ pub async fn unshield(
             live.push(change);
         }
         replace_notes(app, &live, &born_notes)?;
-        if let Some(index) = remember_smart {
-            if !app.secrets.smart_indexes.contains(&index) {
-                app.secrets.smart_indexes.push(index);
-            }
-            wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
-        }
-        if let Some(index) = remember_public {
-            if !app.secrets.public_indexes.contains(&index) {
-                app.secrets.public_indexes.push(index);
-            }
-            if app.secrets.next_public <= index {
-                app.secrets.next_public = index + 1;
-            }
-            wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
-        }
         if app.non_interactive {
             println!(
                 "{}",
                 json!({
                     "publicWei": result.public_amount.to_string(),
+                    "publicEth": fmt_r(result.public_amount),
                     "feeWei": result.fee.to_string(),
+                    "feeEth": fmt_r(result.fee),
                     "recipient": format!("{recipient:#x}"),
                 })
             );
         } else {
             println!(
-                "unshielded {} to {recipient:#x}",
-                fmt_r(result.public_amount)
+                "unshielded {} to {recipient:#x} (fee {})",
+                fmt_r(result.public_amount),
+                fmt_r(result.fee)
             );
         }
         break;
@@ -720,13 +767,15 @@ pub async fn unshield(
     Ok(())
 }
 
-async fn load_one_smart(app: &App, j: u32) -> Result<Smart> {
+
+async fn load_one_smart(app: &App, j: u32, strict: bool) -> Result<Smart> {
     accounts::load_one_smart(
         app.rpc.clone(),
         app.without_tor,
         &app.net,
         &app.secrets,
         j,
+        strict,
     )
     .await
 }
@@ -788,6 +837,212 @@ fn replace_notes(app: &mut App, live: &[Note], born: &[(Note, u32)]) -> Result<(
     wallet::save(&app.root, &app.name, &app.password, &app.secrets)
 }
 
+pub async fn claim(app: &mut App, account: Option<String>) -> Result<()> {
+    let picked = pick_from(app, account.as_deref(), true).await?;
+    let provider = app.provider().await?;
+    chain::ensure_rpc_matches_network(&provider, &app.net).await?;
+    let credit: U256 = ShieldedPool::new(app.net.pool, &provider)
+        .withdrawalCredit(picked.address)
+        .call()
+        .await?;
+    if credit.is_zero() {
+        bail!("no withdrawal credit for {:#x}", picked.address);
+    }
+    let data = Bytes::from(
+        ShieldedPool::claimWithdrawalCall {
+            who: picked.address,
+        }
+        .abi_encode(),
+    );
+    let calls = vec![OutCall::contract(app.net.pool, U256::ZERO, data)];
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
+    let (tip, max_fee) = client.fees_capped(chain::max_fee_cap(&app.net)).await?;
+    commit_calls(
+        app,
+        &client,
+        &picked,
+        &calls,
+        tip,
+        max_fee,
+        json!({
+            "kind": "claim",
+            "path": path_name(&picked),
+            "from": picked.label,
+            "who": format!("{:#x}", picked.address),
+            "creditWei": credit.to_string(),
+            "creditEth": fmt(credit),
+        }),
+    )
+    .await
+}
+
+/// Recover private notes by re-deriving `note_at` indexes and matching shield inners / commitments.
+pub async fn rescan_notes(app: &mut App) -> Result<()> {
+    let provider = app.provider().await?;
+    sync_notes(app, &provider).await?;
+    let msp = provider_for(app).await?;
+    let chain = app.net.chain_id;
+    let pool = app.net.pool;
+    let path = sync_cache::cache_path(&app.root, &app.net.name);
+    let mut cms = std::collections::HashSet::new();
+    if path.exists() {
+        let mut cache =
+            SyncCache::open(&path, app.net.chain_id, app.net.pool, app.net.deployed_block)?;
+        let through = cache.through();
+        for ev in cache.events_through(app.net.deployed_block, through)? {
+            if let kohaku_minimal_shield::indexer::syncer::SyncEvent::LeafAppended { cm, .. } = ev {
+                cms.insert(cm);
+            }
+        }
+    }
+    // Also collect LeafAppended from RPC so a cold cache still works.
+    {
+        use alloy::rpc::types::Filter;
+        use kohaku_minimal_shield::abis::ShieldedPool::LeafAppended;
+        let filter = Filter::new()
+            .address(pool)
+            .event_signature(LeafAppended::SIGNATURE_HASH)
+            .from_block(app.net.deployed_block);
+        for log in provider.get_logs(&filter).await? {
+            if let Ok(ev) = LeafAppended::decode_log(&log.inner) {
+                cms.insert(Ruint::from_be_bytes(ev.data.cm.0));
+            }
+        }
+    }
+    // Shield txs: match note.inner() against shield(bytes32) calldata and value.
+    let mut recovered = Vec::new();
+    let mut found_indexes = std::collections::HashSet::new();
+    {
+        use alloy::rpc::types::Filter;
+        use kohaku_minimal_shield::abis::ShieldedPool::LeafAppended;
+        let filter = Filter::new()
+            .address(pool)
+            .event_signature(LeafAppended::SIGNATURE_HASH)
+            .from_block(app.net.deployed_block);
+        let logs = provider.get_logs(&filter).await?;
+        let shield_sel = &ShieldedPool::shieldCall::SELECTOR;
+        for log in logs {
+            let Some(tx_hash) = log.transaction_hash else {
+                continue;
+            };
+            let Ok(Some(tx)) = provider.get_transaction_by_hash(tx_hash).await else {
+                continue;
+            };
+            let input: &[u8] = tx.input().as_ref();
+            if input.len() < 4 + 32 || input[..4] != *shield_sel {
+                continue;
+            }
+            let mut inner_bytes = [0u8; 32];
+            inner_bytes.copy_from_slice(&input[4..36]);
+            let inner = Ruint::from_be_bytes(inner_bytes);
+            let value = to_r(tx.value());
+            let Ok(ev) = LeafAppended::decode_log(&log.inner) else {
+                continue;
+            };
+            let cm = Ruint::from_be_bytes(ev.data.cm.0);
+            let start = app.secrets.next_note.saturating_sub(8);
+            let end = app.secrets.next_note.saturating_add(64).max(64);
+            let mut gap = 0u32;
+            for index in start..end {
+                let note = wallet::note_at(&app.secrets.mnemonic, index, value, chain, pool)?;
+                if note.inner() == inner && note.commitment() == cm {
+                    if !found_indexes.contains(&index)
+                        && !app.secrets.notes.iter().any(|n| n.index == Some(index))
+                    {
+                        recovered.push(SavedNote {
+                            note,
+                            pending: false,
+                            index: Some(index),
+                        });
+                        found_indexes.insert(index);
+                    }
+                    break;
+                }
+                gap = gap.saturating_add(1);
+                if gap >= 16 && index > app.secrets.next_note {
+                    break;
+                }
+            }
+        }
+    }
+    // Also try matching existing cms against note indexes for known wallet note values
+    // and zero-value placeholders (covers change notes once value is known locally).
+    let candidate_values: Vec<Ruint> = app
+        .secrets
+        .notes
+        .iter()
+        .map(|n| n.note.value)
+        .chain(recovered.iter().map(|n| n.note.value))
+        .chain(std::iter::once(Ruint::ZERO))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let scan_end = app
+        .secrets
+        .next_note
+        .saturating_add(64)
+        .max(found_indexes.iter().copied().max().unwrap_or(0).saturating_add(1));
+    let mut gap = 0u32;
+    for index in 0..scan_end {
+        if found_indexes.contains(&index)
+            || app.secrets.notes.iter().any(|n| n.index == Some(index))
+        {
+            gap = 0;
+            continue;
+        }
+        let mut hit = false;
+        for value in &candidate_values {
+            let note = wallet::note_at(&app.secrets.mnemonic, index, *value, chain, pool)?;
+            let cm = note.commitment();
+            if cms.contains(&cm) {
+                if msp.indexer.tree().leaf_proof(cm).await.is_ok() {
+                    recovered.push(SavedNote {
+                        note,
+                        pending: false,
+                        index: Some(index),
+                    });
+                    found_indexes.insert(index);
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if hit {
+            gap = 0;
+        } else {
+            gap = gap.saturating_add(1);
+            if gap >= 16 && index >= app.secrets.next_note {
+                break;
+            }
+        }
+    }
+    let added = recovered.len();
+    if let Some(max_idx) = found_indexes.iter().copied().max() {
+        if app.secrets.next_note <= max_idx {
+            app.secrets.next_note = max_idx.saturating_add(1);
+        }
+    }
+    app.secrets.notes.extend(recovered);
+    wallet::save(&app.root, &app.name, &app.password, &app.secrets)?;
+    if app.non_interactive {
+        println!(
+            "{}",
+            json!({
+                "recovered": added,
+                "nextNote": app.secrets.next_note,
+                "notes": app.secrets.notes.len(),
+            })
+        );
+    } else {
+        println!(
+            "rescanned notes: recovered {added}, next_note={}, total={}",
+            app.secrets.next_note,
+            app.secrets.notes.len()
+        );
+    }
+    Ok(())
+}
+
 pub async fn publish_epoch_root(app: &mut App, from: Option<String>) -> Result<()> {
     let picked = pick_from(app, from.as_deref(), true).await?;
     let summary = json!({
@@ -820,7 +1075,7 @@ async fn published_slot(app: &App, provider: &impl Provider, epoch: u64) -> Resu
         .event_signature(RootPublished::SIGNATURE_HASH)
         .from_block(app.net.deployed_block);
     let logs = provider.get_logs(&filter).await?;
-    let client = chain::frame_client(&app.rpc);
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
     let latest = client.slot_number().await?;
     let mut best: Option<(u64, u64)> = None;
     for log in logs {
@@ -856,9 +1111,9 @@ async fn publish_root(app: &App, from: &Picked) -> Result<u64> {
         .currentEpoch()
         .call()
         .await?;
-    let client = chain::frame_client(&app.rpc);
-    let (tip, max_fee) = client.fees().await?;
-    let chain = client.chain_id().await?;
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
+    let (tip, max_fee) = client.fees_capped(chain::max_fee_cap(&app.net)).await?;
+    let chain = app.net.chain_id;
     publish_for(app, &from, epoch, chain, tip, max_fee).await
 }
 
@@ -870,7 +1125,7 @@ async fn publish_for(
     tip: U256,
     max_fee: U256,
 ) -> Result<u64> {
-    let client = chain::frame_client(&app.rpc);
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
     let nonce = client.tx_count(from.address).await?;
     let tx = make_publish_tx(app, from, epoch, chain, tip, max_fee, nonce).await?;
     ensure_can_pay(from.balance, tx.max_cost(), U256::ZERO)?;
@@ -1021,26 +1276,39 @@ async fn seed_event_cache(root: &std::path::Path, net: &Network, without_tor: bo
 }
 
 async fn sync_notes(app: &mut App, provider: &impl Provider) -> Result<()> {
+    chain::ensure_rpc_matches_network(provider, &app.net).await?;
     seed_event_cache(&app.root, &app.net, app.without_tor).await;
     let msp = provider_for(app).await?;
-    msp.indexer.sync().await?;
+    if let Err(err) = msp.indexer.sync().await {
+        let msg = err.to_string();
+        if msg.to_ascii_lowercase().contains("invalid root") {
+            bail!(
+                "{err}. Try deleting {} and re-running hydrate-local-cache / balances.",
+                sync_cache::cache_path(&app.root, &app.net.name).display()
+            );
+        }
+        return Err(err.into());
+    }
     let epoch = ShieldedPool::new(app.net.pool, provider)
         .currentEpoch()
         .call()
         .await
         .unwrap_or(0);
     let spent = spent_nullifiers(app, provider).await?;
-    if spent.is_empty() {
-        return Ok(());
-    }
     let mut keep = Vec::new();
-    for saved in app.secrets.notes.drain(..) {
-        if saved.pending {
-            keep.push(saved);
-            continue;
-        }
+    for mut saved in app.secrets.notes.drain(..) {
         let proof = msp.indexer.tree().leaf_proof(saved.note.commitment()).await;
+        if saved.pending {
+            if proof.is_ok() {
+                // Commitment landed in the tree: confirm the pending note.
+                saved.pending = false;
+            } else {
+                keep.push(saved);
+                continue;
+            }
+        }
         let Some(proof) = proof.ok() else {
+            // Confirmed locally but missing from tree — keep until spent scan can decide.
             keep.push(saved);
             continue;
         };
@@ -1076,6 +1344,7 @@ pub async fn hydrate_local_cache(
     let pool = chain::pool_of(net);
     let path = sync_cache::cache_path(root, &net.name);
     let provider = chain::http_provider(rpc, without_tor).await?;
+    chain::ensure_rpc_matches_network(&provider, net).await?;
     let head = provider.get_block_number().await?;
     let mut cache = SyncCache::open(&path, pool.chain_id, pool.address, pool.deployed_block)?;
     let from = cache.through().saturating_add(1).max(pool.deployed_block);
@@ -1084,13 +1353,19 @@ pub async fn hydrate_local_cache(
     if from <= head && !non_interactive {
         eprintln!("hydrating cache blocks {from}..={head}");
     }
-    let extended = if from > head {
+    let safe_head = head.saturating_sub(sync_cache::REORG_MARGIN);
+    let extended = if from > safe_head {
         Extend::Stored {
             through: cache.through(),
         }
     } else {
         let fetched = syncer.fetch(&pool, from, head).await?;
-        cache.extend(from, head, &fetched)?
+        let durable: Vec<_> = fetched
+            .iter()
+            .filter(|e| e.block <= safe_head)
+            .cloned()
+            .collect();
+        cache.extend(from, safe_head, &durable)?
     };
     let through = match extended {
         Extend::Stored { through } | Extend::Full { through } => through,
@@ -1269,11 +1544,12 @@ async fn pick_to(
     to: Option<String>,
     allow_new_eoa: bool,
     deployed_smart_only: bool,
+    strict_smart: bool,
 ) -> Result<Address> {
     if let Some(spec) = to {
         if let Some(rest) = spec.strip_prefix('a') {
             let j: u32 = rest.parse().context("aN")?;
-            let smart = load_one_smart(app, j).await?;
+            let smart = load_one_smart(app, j, strict_smart).await?;
             if deployed_smart_only && !smart.deployed {
                 bail!(
                     "a{j} is not deployed. Plain unshield needs a deployed account. Use --tail-calls to create it."
@@ -1313,6 +1589,7 @@ async fn pick_to(
         Some(entered),
         allow_new_eoa,
         deployed_smart_only,
+        strict_smart,
     ))
     .await
 }
@@ -1327,7 +1604,7 @@ async fn pick_value(
     let cap = balance.checked_sub(reserve).unwrap_or(U256::ZERO);
     if cap.is_zero() {
         bail!(
-            "balance {} cannot cover gas {}. Unshield ETH to this account first.",
+            "balance {} ETH cannot cover gas {}. Fund this account or unshield to it first.",
             fmt(balance),
             fmt(reserve)
         );
@@ -1398,18 +1675,55 @@ fn parse_raw(targets: &str, payloads: &str, values: Option<&str>) -> Result<Vec<
 fn parse_tail(spec: &str) -> Result<Vec<Call>> {
     let mut calls = Vec::new();
     for part in spec.split(',') {
-        let mut bits = part.split(':');
-        let target: Address = bits.next().context("target")?.parse()?;
-        let data = hex::decode(bits.next().context("calldata")?.trim_start_matches("0x"))?;
-        let value = match bits.next() {
-            Some(v) => v.parse().context("value")?,
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let bits: Vec<&str> = part.splitn(3, ':').collect();
+        if bits.len() < 2 || bits.len() > 3 {
+            bail!(
+                "bad --tail-calls entry `{part}`: expected target:calldata or target:calldata:value                  (use target:0x:value for a plain ETH transfer)"
+            );
+        }
+        let target: Address = bits[0]
+            .parse()
+            .with_context(|| format!("target in `{part}`"))?;
+        let data_hex = bits[1];
+        if !data_hex.is_empty()
+            && !data_hex.eq_ignore_ascii_case("0x")
+            && !data_hex.starts_with("0x")
+            && !data_hex.starts_with("0X")
+        {
+            bail!(
+                "bad --tail-calls entry `{part}`: calldata must be 0x-prefixed hex                  (did you mean `{target:#x}:0x:{data_hex}` for an ETH transfer?)"
+            );
+        }
+        let data = if data_hex.is_empty() || data_hex.eq_ignore_ascii_case("0x") {
+            Vec::new()
+        } else {
+            let hex_body = data_hex
+                .strip_prefix("0x")
+                .or_else(|| data_hex.strip_prefix("0X"))
+                .unwrap_or(data_hex);
+            hex::decode(hex_body).with_context(|| format!("calldata in `{part}`"))?
+        };
+        let value = match bits.get(2) {
+            Some(v) => v.parse().with_context(|| format!("value in `{part}`"))?,
             None => U256::ZERO,
         };
+        if bits.len() == 2 && data.is_empty() {
+            bail!(
+                "bad --tail-calls entry `{part}`: missing calldata (use `{target:#x}:0x` or                  `{target:#x}:0x:<wei>`)"
+            );
+        }
         calls.push(Call {
             target,
             value,
             data: Bytes::from(data),
         });
+    }
+    if calls.is_empty() {
+        bail!("--tail-calls is empty");
     }
     Ok(calls)
 }
@@ -1420,9 +1734,9 @@ async fn build_from(
     calls: Vec<OutCall>,
     tip: U256,
     max_fee: U256,
+    chain: u64,
 ) -> Result<kohaku_frametx_kit::FrameTx> {
     let nonce = client.tx_count(from.address).await?;
-    let chain = client.chain_id().await?;
     if let Some(signer) = &from.eoa {
         return txbuild::eoa_frames(signer, &calls, nonce, chain, tip, max_fee);
     }
@@ -1466,7 +1780,7 @@ const CALL_STATE_PLACE: u64 = 200_000;
 fn ensure_can_pay(balance: U256, max_cost: U256, value: U256) -> Result<()> {
     if balance < max_cost + value {
         bail!(
-            "this account holds {} which cannot cover {} plus gas {}. Unshield ETH to it first, then retry.",
+            "this account holds {} ETH which cannot cover {} ETH plus up to {} ETH gas.              Fund the EOA (faucet / transfer) or unshield to it first, then retry.",
             fmt(balance),
             fmt(value),
             fmt(max_cost)
@@ -1481,7 +1795,7 @@ fn want_broadcast(app: &App, summary: &Value) -> Result<bool> {
         return Ok(false);
     }
     if !app.non_interactive {
-        println!("{summary}");
+        print_plan_human(summary);
         let ok = Confirm::new()
             .with_prompt("Broadcast?")
             .default(app.broadcast_flag)
@@ -1489,6 +1803,39 @@ fn want_broadcast(app: &App, summary: &Value) -> Result<bool> {
         return Ok(ok);
     }
     Ok(true)
+}
+
+fn print_plan_human(summary: &Value) {
+    if let Some(kind) = summary.get("kind").and_then(|v| v.as_str()) {
+        println!("plan: {kind}");
+    }
+    for key in [
+        "eth",
+        "publicEth",
+        "feeEthGuess",
+        "feeEth",
+        "netEthGuess",
+        "gasReserveEth",
+        "from",
+        "to",
+        "recipient",
+        "path",
+        "account",
+        "wei",
+        "publicWei",
+        "feeWeiGuess",
+        "maxFeePerGasWei",
+        "calls",
+        "transactions",
+        "atomic",
+        "tail",
+    ] {
+        if let Some(v) = summary.get(key) {
+            if !v.is_null() {
+                println!("  {key}: {v}");
+            }
+        }
+    }
 }
 
 async fn commit_calls(
@@ -1500,42 +1847,40 @@ async fn commit_calls(
     max_fee: U256,
     mut summary: Value,
 ) -> Result<()> {
-    let txs = plan_txs(client, from, calls, tip, max_fee).await?;
+    let chain = app.net.chain_id;
+    let value = calls.iter().fold(U256::ZERO, |acc, call| acc + call.value);
+    // Estimate gas without simulating or signing a multi-call batch for dry-run.
+    let reserve = call_cost(client, from, calls, tip, max_fee, chain).await?;
+    ensure_can_pay(from.balance, reserve, value)?;
     if let Some(obj) = summary.as_object_mut() {
-        obj.insert("transactions".into(), json!(txs.len()));
-        obj.insert("atomic".into(), json!(calls.len() > 1 && txs.len() == 1));
+        obj.insert("maxFeePerGasWei".into(), json!(max_fee.to_string()));
+        obj.insert("gasReserveWei".into(), json!(reserve.to_string()));
+        obj.insert("gasReserveEth".into(), json!(fmt(reserve)));
+        if let Some(wei) = obj.get("wei").and_then(|v| v.as_str()) {
+            if let Ok(w) = wei.parse::<U256>() {
+                obj.insert("eth".into(), json!(fmt(w)));
+            }
+        }
+        // Atomicity unknown until a post-confirm simulation.
+        obj.insert("atomic".into(), json!(null));
+        obj.insert("transactions".into(), json!(null));
     }
     if !want_broadcast(app, &summary)? {
         return Ok(());
     }
-    let sent = if txs.len() == 1 && calls.len() > 1 && from.eoa.is_some() {
-        match send_and_wait(client, &txs[0]).await {
-            Ok(receipt) => vec![receipt],
-            Err(err) if rejects_atomic_flag(&err.to_string()) => {
-                let seq = eoa_sequence(
-                    client,
-                    from.eoa.as_ref().context("eoa")?,
-                    calls,
-                    tip,
-                    max_fee,
-                )
-                .await?;
-                let mut receipts = Vec::new();
-                for tx in &seq {
-                    receipts.push(send_and_wait(client, tx).await?);
-                }
-                receipts
-            }
-            Err(err) => return Err(err),
-        }
-    } else {
-        let mut receipts = Vec::new();
-        for tx in &txs {
-            receipts.push(send_and_wait(client, tx).await?);
-        }
-        receipts
-    };
-    let hash = sent
+    let txs = plan_txs(app, client, from, calls, tip, max_fee, chain).await?;
+    if let Some(obj) = summary.as_object_mut() {
+        obj.insert("transactions".into(), json!(txs.len()));
+        obj.insert(
+            "atomic".into(),
+            json!(calls.len() > 1 && txs.len() == 1),
+        );
+    }
+    let mut receipts = Vec::new();
+    for tx in &txs {
+        receipts.push(send_and_wait(client, tx).await?);
+    }
+    let hash = receipts
         .last()
         .and_then(|r| r.get("transactionHash"))
         .cloned()
@@ -1549,18 +1894,21 @@ async fn commit_calls(
 }
 
 async fn plan_txs(
+    app: &App,
     client: &FrameTxClient,
     from: &Picked,
     calls: &[OutCall],
     tip: U256,
     max_fee: U256,
+    chain: u64,
 ) -> Result<Vec<FrameTx>> {
     let value = calls.iter().fold(U256::ZERO, |acc, call| acc + call.value);
     if from.eoa.is_some() && calls.len() > 1 {
-        let batch = build_from(client, from, calls.to_vec(), tip, max_fee).await?;
+        let batch = build_from(client, from, calls.to_vec(), tip, max_fee, chain).await?;
         let split = match client.simulate(&batch.raw()).await {
             Ok(Some(sim)) => atomic_rejected(&sim),
-            _ => false,
+            Ok(None) => false,
+            Err(_) => false,
         };
         if split {
             let seq = eoa_sequence(
@@ -1569,16 +1917,27 @@ async fn plan_txs(
                 calls,
                 tip,
                 max_fee,
+                chain,
             )
             .await?;
             let cost = seq.iter().fold(U256::ZERO, |acc, tx| acc + tx.max_cost());
             ensure_can_pay(from.balance, cost, value)?;
+            let split_plan = json!({
+                "kind": "split-sequential",
+                "reason": "RPC rejected atomic multi-call; confirm sending one transaction per call",
+                "transactions": seq.len(),
+                "gasReserveWei": cost.to_string(),
+                "gasReserveEth": fmt(cost),
+            });
+            if !want_broadcast(app, &split_plan)? {
+                bail!("cancelled after atomic multi-call was rejected by simulation");
+            }
             return Ok(seq);
         }
         ensure_can_pay(from.balance, batch.max_cost(), value)?;
         return Ok(vec![batch]);
     }
-    let tx = build_from(client, from, calls.to_vec(), tip, max_fee).await?;
+    let tx = build_from(client, from, calls.to_vec(), tip, max_fee, chain).await?;
     ensure_can_pay(from.balance, tx.max_cost(), value)?;
     Ok(vec![tx])
 }
@@ -1589,9 +1948,13 @@ async fn call_cost(
     calls: &[OutCall],
     tip: U256,
     max_fee: U256,
+    chain: u64,
 ) -> Result<U256> {
-    let tx = build_from(client, from, calls.to_vec(), tip, max_fee).await?;
-    Ok(tx.max_cost())
+    // Single-call estimate only: multi-call atomicity is checked after confirm.
+    let first = calls.first().cloned().into_iter().collect::<Vec<_>>();
+    let tx = build_from(client, from, first, tip, max_fee, chain).await?;
+    let per = tx.max_cost();
+    Ok(per.saturating_mul(U256::from(calls.len().max(1) as u64)))
 }
 
 async fn eoa_sequence(
@@ -1600,9 +1963,9 @@ async fn eoa_sequence(
     calls: &[OutCall],
     tip: U256,
     max_fee: U256,
+    chain: u64,
 ) -> Result<Vec<FrameTx>> {
     let mut nonce = client.tx_count(signer.address()).await?;
-    let chain = client.chain_id().await?;
     let mut out = Vec::with_capacity(calls.len());
     for call in calls {
         out.push(txbuild::eoa_frames(
@@ -1617,6 +1980,7 @@ async fn eoa_sequence(
     }
     Ok(out)
 }
+
 
 async fn shield_cost(
     app: &App,
@@ -1642,7 +2006,7 @@ async fn shield_tx(
     tip: U256,
     max_fee: U256,
 ) -> Result<FrameTx> {
-    let client = chain::frame_client(&app.rpc);
+    let client = chain::frame_client(&app.rpc, app.without_tor).await?;
     let nonce = client.tx_count(from.address).await?;
     match (&from.eoa, &from.smart) {
         (Some(signer), None) => {
@@ -1745,6 +2109,7 @@ async fn prompt_tail_account(app: &App) -> Result<Smart> {
             app.without_tor,
             &app.net,
             &app.secrets,
+            true,
         )
         .await;
     }
@@ -1753,7 +2118,7 @@ async fn prompt_tail_account(app: &App) -> Result<Smart> {
         .strip_prefix('a')
         .context("use aN, for example a0")?;
     let j: u32 = rest.parse().context("smart selector")?;
-    load_one_smart(app, j).await
+    load_one_smart(app, j, true).await
 }
 
 fn path_name(picked: &Picked) -> &'static str {
@@ -1776,22 +2141,35 @@ fn rejects_atomic_flag(text: &str) -> bool {
     text.contains("atomic") || text.contains("flag")
 }
 
+pub(crate) fn receipt_status_ok(v: &Value) -> bool {
+    v.get("status")
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s == "0x1" || s == "1")
+}
+
+/// Reject receipts that only have `frameReceipts` without every frame succeeding.
+pub(crate) fn receipt_all_ok(receipt: &Value) -> Result<()> {
+    if !receipt_status_ok(receipt) {
+        bail!("transaction failed (status != 0x1): {receipt}");
+    }
+    if let Some(frames) = receipt.get("frameReceipts").and_then(Value::as_array) {
+        for (i, frame) in frames.iter().enumerate() {
+            if !receipt_status_ok(frame) {
+                bail!("frame {i} failed (status != 0x1): {frame}");
+            }
+        }
+    } else {
+        bail!("receipt missing frameReceipts: {receipt}");
+    }
+    Ok(())
+}
+
 async fn send_and_wait(client: &FrameTxClient, tx: &FrameTx) -> Result<Value> {
     client.gate_spend(tx).await?;
     let hash = client.send_raw(&tx.raw()).await?;
     println!("sent {hash:#x}");
     let receipt = client.wait_receipt(hash, 360).await?;
-    let ok = receipt
-        .get("status")
-        .and_then(|v| v.as_str())
-        .is_none_or(|s| s == "0x1" || s == "1")
-        || receipt
-            .get("frameReceipts")
-            .and_then(Value::as_array)
-            .is_some_and(|f| !f.is_empty());
-    if !ok {
-        bail!("transaction reverted: {receipt}");
-    }
+    receipt_all_ok(&receipt)?;
     Ok(receipt)
 }
 
@@ -1860,11 +2238,13 @@ fn fmt_r(v: Ruint) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_rejected, estimate_public_rpc_steps_for, max_withdrawable, rejects_atomic_flag, ru64,
+        atomic_rejected, estimate_public_rpc_steps_for, max_withdrawable, receipt_all_ok,
+        receipt_status_ok, rejects_atomic_flag, ru64,
     };
     use alloy::primitives::Address;
     use kohaku_frametx_kit::SimulateResult;
     use kohaku_minimal_shield::{Note, plan_unshield};
+    use serde_json::json;
 
     fn sim(valid: Option<bool>, violation: Option<&str>) -> SimulateResult {
         SimulateResult {
@@ -1878,6 +2258,26 @@ mod tests {
             frames: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn receipt_rejects_failed_frame_even_when_frame_receipts_present() {
+        let bad = json!({
+            "status": "0x1",
+            "frameReceipts": [
+                { "status": "0x1" },
+                { "status": "0x0" }
+            ]
+        });
+        assert!(receipt_status_ok(&bad));
+        assert!(receipt_all_ok(&bad).is_err());
+        let good = json!({
+            "status": "0x1",
+            "frameReceipts": [{ "status": "0x1" }, { "status": "1" }]
+        });
+        assert!(receipt_all_ok(&good).is_ok());
+        let missing = json!({ "status": "0x1" });
+        assert!(receipt_all_ok(&missing).is_err());
     }
 
     #[test]

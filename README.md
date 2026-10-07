@@ -1,80 +1,52 @@
 # hegota-kohaku-cli
 
-a cli that mirors the functionality of kohaku-cli but works with hegota EIPs and a new ETH shielded pool design (that integrates those hegota EIPs)
+CLI wallet for Hegota (FrameTx + minimal shielded pool). Mirrors kohaku-cli flows against hegota EIPs.
 
-## setup
+## Setup
 
-you need the kohaku-rs repo at this branch https://github.com/ethereum/kohaku-rs/tree/experiments/minimal-shield-frames
+You need [kohaku-rs](https://github.com/ethereum/kohaku-rs) on branch `experiments/minimal-shield-frames` as a path dependency (see `Cargo.toml`).
 
-make sure to correctly point to your path of kohaku-rs repo in Cargo.toml (these lines)
-
-```
-kohaku-frametx-kit = { path = "../kohaku-rs/crates/frametx-kit" }
-kohaku-kv-store = { path = "../kohaku-rs/crates/kv-store" }
-kohaku-minimal-shield = { path = "../kohaku-rs/crates/minimal-shield" }
-```
-
-
-now from this repo root run
-
-```
+```bash
 cargo build --release
-```
-
-set env vars:
-
-```
 export PATH="$PWD/target/release:$PATH"
-export HEGOTA_RPC_URL="<hegota devnet rpc>"
+export HEGOTA_RPC_URL="https://rpc1.privacy.ethrex.xyz"
 ```
 
-you need a devnet RPC url.
+Devnet chain id is **8141**. Tor is used by default for RPC; pass `--without-tor` or set `DISABLE_TOR=1` only if you must.
 
-now you can run all the `kohaku-hegota` commands and demo the wallet.
+Optional first-sync speed-up (opt-in; never defaulted by the binary):
 
-## demo
-
+```bash
+export EVENT_CACHE_ENDPOINT="https://artifacts.0000000000.org/hegota/devnet/pool-sync.bin"
 ```
+
+Fund EOAs from the public faucet / whoever distributes devnet ETH for this network.
+
+## Demo
+
+```bash
 kohaku-hegota create-wallet dev
-```
-
-creates your wallet
-
-
-```
 kohaku-hegota balances --verbose
+# fund EOA 0, then:
+kohaku-hegota shield --from 0 --amount-formatted 0.01
+kohaku-hegota unshield --next --amount-formatted 0.005
+kohaku-hegota claim --from 0   # if you have withdrawal credit
+kohaku-hegota rescan           # recover notes from mnemonic + chain
 ```
 
-sync wallet see empty balances. (slow only first time) 
+Dry-runs are the default in `--non-interactive` mode unless `--broadcast` is set. Confirmations show human ETH amounts and fee estimates.
 
-copy EOA zero to fund it. now fund EOA 0 with some devnet ETH.
+## What's new in 0.0.2
 
-```
-kohaku-hegota shield
-```
+- Tor for FrameTx (isolated circuit per send) when Tor is enabled
+- Offline CREATE2 FrameAccount prediction + pinned creation bytecode
+- Sync cache reorg margin (32 blocks) and stricter event-cache validation
+- Pending notes kept after broadcast; confirmed on sync; `rescan` / `claim`
+- Fee cap (`max_fee_gwei`), fee shown in confirm, profile chain id for signing
+- Stricter receipts; safer dry-run (no pre-confirm signed txs / silent split-resend)
 
-shield some eth
-
-```
-kohaku-hegota balances --verbose
-```
-
-see result
-
-```
-kohaku-hegota unshield --next
+```bash
+kohaku-hegota doctor   # offline CREATE2 pin, fee cap, and Tor mode
 ```
 
-unshield some eth to your own fresh EOA
-
-```
-kohaku-hegota unshield --next --tail-calls 0xRecipient::{amount of ETH to forward in wei}
-```
-
-unshield some eth to your own fresh smart account which then forwards ETH to 0xRecipient.
-
-```
-kohaku-hegota balances --verbose
-```
-
-see wallet result now
+Issue write-up (disposable): [docs/ISSUE_SOLUTIONS.md](docs/ISSUE_SOLUTIONS.md).

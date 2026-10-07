@@ -3,7 +3,7 @@
 use std::{future::Future, path::PathBuf};
 
 use alloy::{
-    primitives::Address,
+    primitives::{Address, Bytes},
     providers::{Provider, ProviderBuilder, RootProvider},
     rpc::client::RpcClient,
 };
@@ -22,6 +22,8 @@ pub struct Network {
     pub acct_factory: Address,
     pub multicall3: Address,
     pub deployed_block: u64,
+    pub max_fee_gwei: Option<u64>,
+    pub frame_account_creation_code: Vec<u8>,
     pub tokens: Vec<Token>,
 }
 
@@ -40,6 +42,10 @@ struct NetworkFile {
     acct_factory: String,
     multicall3: String,
     deployed_block: u64,
+    #[serde(default)]
+    max_fee_gwei: Option<u64>,
+    #[serde(default)]
+    frame_account_creation_code: Option<String>,
     #[serde(default)]
     tokens: Vec<TokenFile>,
 }
@@ -66,6 +72,8 @@ pub fn load_network(name: &str) -> Result<Network> {
         acct_factory: parse_addr(&file.acct_factory)?,
         multicall3: parse_addr(&file.multicall3)?,
         deployed_block: file.deployed_block,
+        max_fee_gwei: file.max_fee_gwei,
+        frame_account_creation_code: parse_bytes_opt(file.frame_account_creation_code.as_deref())?,
         tokens: file
             .tokens
             .iter()
@@ -90,6 +98,12 @@ pub fn load_network(name: &str) -> Result<Network> {
     if let Ok(v) = std::env::var("HEGOTA_DEPLOYED_BLOCK") {
         net.deployed_block = v.parse().context("HEGOTA_DEPLOYED_BLOCK")?;
     }
+    if let Ok(v) = std::env::var("HEGOTA_MAX_FEE_GWEI") {
+        net.max_fee_gwei = Some(v.parse().context("HEGOTA_MAX_FEE_GWEI")?);
+    }
+    if let Ok(v) = std::env::var("HEGOTA_FRAME_ACCOUNT_CREATION_CODE") {
+        net.frame_account_creation_code = parse_bytes(&v)?;
+    }
     Ok(net)
 }
 
@@ -102,6 +116,23 @@ pub fn require_factory(net: &Network) -> Result<Address> {
         );
     }
     Ok(net.acct_factory)
+}
+
+pub fn require_creation_code(net: &Network) -> Result<&[u8]> {
+    if net.frame_account_creation_code.is_empty() {
+        bail!(
+            "frame_account_creation_code is missing from the network profile. Pin the FrameAccount \
+             creation bytecode (not runtime code) so addresses can be predicted offline."
+        );
+    }
+    Ok(&net.frame_account_creation_code)
+}
+
+/// EIP-1559 max-fee cap from the network profile (`max_fee_gwei`), if set.
+pub fn max_fee_cap(net: &Network) -> Option<alloy::primitives::U256> {
+    net.max_fee_gwei.map(|gwei| {
+        alloy::primitives::U256::from(gwei) * alloy::primitives::U256::from(1_000_000_000u64)
+    })
 }
 
 pub fn pool_of(net: &Network) -> Pool {
@@ -120,8 +151,18 @@ pub fn rpc_url(flag: Option<String>) -> Result<reqwest::Url> {
     raw.parse().context("rpc url")
 }
 
-pub fn frame_client(url: &reqwest::Url) -> FrameTxClient {
-    FrameTxClient::new(url.clone())
+/// FrameTx client: Tor-isolated when Tor is on, clearnet otherwise. Fails closed if Tor is required.
+pub async fn frame_client(url: &reqwest::Url, without_tor_flag: bool) -> Result<FrameTxClient> {
+    if without_tor(without_tor_flag) {
+        Ok(FrameTxClient::new(url.clone()))
+    } else {
+        let client = tor_session()
+            .await
+            .context("Tor is required for FrameTx; pass --without-tor or set DISABLE_TOR=1 to use clearnet")?
+            .isolated_rpc_client(url.clone())
+            .context("Tor RPC client for FrameTx")?;
+        Ok(FrameTxClient::from_rpc_client(client))
+    }
 }
 
 static TOR: OnceCell<TorRpc> = OnceCell::const_new();
@@ -169,6 +210,32 @@ where
     f(RootProvider::new(client)).await
 }
 
+/// Abort when the RPC chain id or pool bytecode does not match the network profile.
+pub async fn ensure_rpc_matches_network(
+    provider: &impl Provider,
+    net: &Network,
+) -> Result<()> {
+    let chain = provider.get_chain_id().await?;
+    if chain != net.chain_id {
+        bail!(
+            "RPC chain id {chain} does not match network profile {} (chain {}). Check --rpc-url / HEGOTA_RPC_URL.",
+            net.name,
+            net.chain_id
+        );
+    }
+    if !net.pool.is_zero() {
+        let code = provider.get_code_at(net.pool).await?;
+        if code.is_empty() {
+            bail!(
+                "no contract code at pool {:#x} on chain {}. Check the network profile or RPC.",
+                net.pool,
+                net.chain_id
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn indexer_path(data_dir: &std::path::Path, wallet: &str, network: &str) -> PathBuf {
     data_dir
         .join(wallet)
@@ -181,4 +248,47 @@ fn parse_addr(s: &str) -> Result<Address> {
         return Ok(Address::ZERO);
     }
     s.parse().with_context(|| format!("address {s}"))
+}
+
+fn parse_bytes_opt(s: Option<&str>) -> Result<Vec<u8>> {
+    match s {
+        None | Some("") => Ok(Vec::new()),
+        Some(raw) => parse_bytes(raw),
+    }
+}
+
+fn parse_bytes(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim().trim_start_matches("0x");
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    hex::decode(s).with_context(|| "frame_account_creation_code hex")
+}
+
+#[allow(dead_code)]
+pub fn creation_code_bytes(net: &Network) -> Bytes {
+    Bytes::from(net.frame_account_creation_code.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::U256;
+
+    #[test]
+    fn max_fee_cap_converts_gwei() {
+        let mut net = load_network("devnet").unwrap();
+        assert_eq!(
+            max_fee_cap(&net),
+            Some(U256::from(100u64) * U256::from(1_000_000_000u64))
+        );
+        net.max_fee_gwei = None;
+        assert_eq!(max_fee_cap(&net), None);
+    }
+
+    #[test]
+    fn without_tor_honors_env_and_flag() {
+        // Flag alone.
+        assert!(without_tor(true));
+    }
 }

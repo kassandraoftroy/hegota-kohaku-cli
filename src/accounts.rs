@@ -9,7 +9,10 @@ use alloy::{
     sol,
 };
 use anyhow::{Result, bail};
-use kohaku_minimal_shield::{abis::FrameAccountFactory, frame_account_salt};
+use kohaku_minimal_shield::{
+    abis::{FrameAccount, FrameAccountFactory},
+    frame_account_salt, predict_frame_account,
+};
 
 use crate::{
     chain::{self, Network, Token},
@@ -61,17 +64,82 @@ pub fn smart_owner(secrets: &Secrets, index: u32) -> Result<PrivateKeySigner> {
     signer_at(&secrets.mnemonic, &smart_owner_path(index))
 }
 
+#[allow(dead_code)] // strict helper; fund paths call predict_account_mode(..., true) directly
 pub async fn predict_account(
     provider: &impl Provider,
     factory: Address,
     owner: Address,
+    creation_code: &[u8],
+) -> Result<Address> {
+    predict_account_mode(provider, factory, owner, creation_code, true).await
+}
+
+/// Resolve a FrameAccount address.
+///
+/// * `strict` (transfers / unshield tails): undeployed accounts must have local CREATE2
+///   equal to RPC `getAddress`. Deployed accounts must report `owner()` equal to `owner`.
+/// * non-strict (balances / scan): prefer RPC `getAddress`; verify `owner()` when deployed.
+///   A stale `frame_account_creation_code` pin only warns.
+pub async fn predict_account_mode(
+    provider: &impl Provider,
+    factory: Address,
+    owner: Address,
+    creation_code: &[u8],
+    strict: bool,
 ) -> Result<Address> {
     let salt = frame_account_salt(owner);
-    let addr = FrameAccountFactory::new(factory, provider)
+    let rpc = FrameAccountFactory::new(factory, provider)
         .getAddress(owner, salt)
         .call()
         .await?;
-    Ok(addr)
+    let code = provider.get_code_at(rpc).await?;
+    let deployed = !code.is_empty();
+
+    if deployed {
+        let onchain_owner = FrameAccount::new(rpc, provider).owner().call().await?;
+        if onchain_owner != owner {
+            bail!(
+                "FrameAccount {rpc:#x} owner is {onchain_owner:#x}, expected {owner:#x}; refusing RPC address"
+            );
+        }
+        if !creation_code.is_empty() {
+            let local = predict_frame_account(factory, owner, creation_code);
+            if local != rpc {
+                eprintln!(
+                    "warning: frame_account_creation_code is stale \
+                     (local CREATE2 {local:#x} != on-chain {rpc:#x}); using owner-verified account"
+                );
+            }
+        }
+        return Ok(rpc);
+    }
+
+    // Undeployed: offline CREATE2 must agree with the factory before we ever send funds there.
+    if creation_code.is_empty() {
+        if strict {
+            bail!(
+                "frame_account_creation_code is required to predict undeployed smart-account addresses"
+            );
+        }
+        return Ok(rpc);
+    }
+    let local = predict_frame_account(factory, owner, creation_code);
+    if local != rpc {
+        if strict {
+            bail!(
+                "FrameAccount CREATE2 pin mismatch: local {local:#x} != RPC getAddress {rpc:#x}.\n\
+                 Update `frame_account_creation_code` in the network profile (or set \
+                 HEGOTA_FRAME_ACCOUNT_CREATION_CODE) to the creation bytecode baked into the \
+                 factory. Refusing to use an undeployed RPC prediction alone."
+            );
+        }
+        eprintln!(
+            "warning: frame_account_creation_code is stale \
+             (local CREATE2 {local:#x} != RPC {rpc:#x}); using RPC address for scan only"
+        );
+        return Ok(rpc);
+    }
+    Ok(local)
 }
 
 async fn fetch_tokens(
@@ -162,6 +230,7 @@ pub async fn load_smart(
     let mut j = 0u32;
     let limit = seen.iter().copied().max().unwrap_or(0).saturating_add(8);
     let factory = net.acct_factory;
+    let creation_code = crate::chain::require_creation_code(net)?.to_vec();
     let mnemonic = secrets.mnemonic.clone();
     loop {
         if j > limit && !seen.contains(&j) {
@@ -170,10 +239,18 @@ pub async fn load_smart(
         let seen = seen.clone();
         let mnemonic = mnemonic.clone();
         let tokens = tokens.to_vec();
+        let creation_code = creation_code.clone();
         let (smart, held, rpcs, stop) =
             chain::with_isolated_provider(url.clone(), without_tor, |provider| async move {
                 let owner = signer_at(&mnemonic, &smart_owner_path(j))?;
-                let account = predict_account(&provider, factory, owner.address()).await?;
+                let account = predict_account_mode(
+                    &provider,
+                    factory,
+                    owner.address(),
+                    &creation_code,
+                    false,
+                )
+                .await?;
                 let mut rpcs = 1u64;
                 let code = provider.get_code_at(account).await?;
                 rpcs += 1;
@@ -218,19 +295,31 @@ pub async fn load_smart(
 }
 
 /// Lowest `j` whose FrameAccount has no code. Each probe uses its own isolation session.
+///
+/// Pass `strict = true` for fund destinations (`--tail-calls --next`); `false` for scan-only.
 pub async fn next_free_smart(
     url: reqwest::Url,
     without_tor: bool,
     net: &Network,
     secrets: &Secrets,
+    strict: bool,
 ) -> Result<Smart> {
     let factory = crate::chain::require_factory(net)?;
+    let creation_code = crate::chain::require_creation_code(net)?.to_vec();
     let mnemonic = secrets.mnemonic.clone();
     for j in 0..10_000u32 {
         let mnemonic = mnemonic.clone();
+        let creation_code = creation_code.clone();
         let smart = chain::with_isolated_provider(url.clone(), without_tor, |provider| async move {
             let owner = signer_at(&mnemonic, &smart_owner_path(j))?;
-            let account = predict_account(&provider, factory, owner.address()).await?;
+            let account = predict_account_mode(
+                &provider,
+                factory,
+                owner.address(),
+                &creation_code,
+                strict,
+            )
+            .await?;
             let code = provider.get_code_at(account).await?;
             if !code.is_empty() {
                 return Ok(None);
@@ -253,18 +342,29 @@ pub async fn next_free_smart(
 }
 
 /// One smart account on a single isolation session.
+///
+/// Pass `strict = true` when the address will receive funds (`transfer --to aN`, unshield).
 pub async fn load_one_smart(
     url: reqwest::Url,
     without_tor: bool,
     net: &Network,
     secrets: &Secrets,
     j: u32,
+    strict: bool,
 ) -> Result<Smart> {
     let factory = crate::chain::require_factory(net)?;
+    let creation_code = crate::chain::require_creation_code(net)?.to_vec();
     let mnemonic = secrets.mnemonic.clone();
     chain::with_isolated_provider(url, without_tor, |provider| async move {
         let owner = signer_at(&mnemonic, &smart_owner_path(j))?;
-        let account = predict_account(&provider, factory, owner.address()).await?;
+        let account = predict_account_mode(
+            &provider,
+            factory,
+            owner.address(),
+            &creation_code,
+            strict,
+        )
+        .await?;
         let code = provider.get_code_at(account).await?;
         let balance = provider.get_balance(account).await?;
         Ok(Smart {
@@ -422,16 +522,25 @@ pub async fn scan_imported(
     let smart_scanned = smart_later;
     let smart = if smart_scanned {
         let factory = net.acct_factory;
+        let creation_code = crate::chain::require_creation_code(net)?.to_vec();
         let mnemonic_owned = mnemonic.to_string();
         let url = url.clone();
         scan_index_batches(
             |index| {
                 let url = url.clone();
                 let mnemonic = mnemonic_owned.clone();
+                let creation_code = creation_code.clone();
                 async move {
                     chain::with_isolated_provider(url, without_tor, |provider| async move {
                         let owner = signer_at(&mnemonic, &smart_owner_path(index))?;
-                        let account = predict_account(&provider, factory, owner.address()).await?;
+                        let account = predict_account_mode(
+                            &provider,
+                            factory,
+                            owner.address(),
+                            &creation_code,
+                            false,
+                        )
+                        .await?;
                         address_was_used(&provider, account).await
                     })
                     .await
@@ -465,7 +574,23 @@ pub async fn scan_imported(
 
 #[cfg(test)]
 mod tests {
-    use super::scan_index_batches;
+    use super::*;
+    use alloy::primitives::address;
+    use kohaku_minimal_shield::predict_frame_account;
+    use crate::chain::load_network;
+
+    #[test]
+    fn offline_create2_matches_devnet_selfcheck_vector() {
+        let net = load_network("devnet").unwrap();
+        let owner = address!("0x77ce0b7bab0a63a59b27c84fe7a5dc6ca3ec556e");
+        let expected = address!("0x9b6c14e6bb1d0ac5616caf5adf0449e426217f4b");
+        let predicted =
+            predict_frame_account(net.acct_factory, owner, &net.frame_account_creation_code);
+        assert_eq!(predicted, expected);
+        // Wrong creation code must not collide with the live account.
+        let wrong = predict_frame_account(net.acct_factory, owner, &[0u8; 32]);
+        assert_ne!(wrong, expected);
+    }
 
     #[tokio::test]
     async fn unused_first_batch_stores_nothing() {
